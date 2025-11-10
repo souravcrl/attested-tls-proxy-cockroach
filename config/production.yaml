@@ -1,0 +1,34 @@
+# Production Configuration
+# This config is for deployment in GCP SEV-SNP VM with CRDB in same TEE
+
+proxy:
+  listen: "0.0.0.0:26257"  # External clients connect here
+  backend:
+    # Connect to CockroachDB running on same machine
+    host: "localhost"
+    port: 26258
+    # Preferred: use Unix socket for best performance (same-VM)
+    # unix_socket: "/var/run/cockroachdb/cockroach.sock"
+    tls:
+      enabled: true
+      ca_cert: "/opt/atls-proxy/certs/ca.crt"
+      client_cert: "/opt/atls-proxy/certs/client.proxy_user.crt"
+      client_key: "/opt/atls-proxy/certs/client.proxy_user.key"
+
+attestation:
+  provider: "sev-snp"  # Real SEV-SNP attestation
+  policy_file: "/opt/atls-proxy/policy.yaml"
+  nonce_ttl: 300s  # 5 minutes - prevent replay attacks
+
+tokens:
+  sts_url: "https://sts.example.com/token"  # Replace with actual STS endpoint
+  token_ttl: 3600s  # 1 hour tokens
+  dpop_enabled: true  # Enable DPoP for production
+
+logging:
+  level: "info"  # Production logging level
+  audit_file: "/var/log/atls-proxy/audit.json"
+
+policy:
+  require_fresh_attestation: true  # Enforce fresh attestation
+  max_attestation_age: 60s  # Maximum 1 minute old attestations

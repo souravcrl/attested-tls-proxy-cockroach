@@ -1,0 +1,30 @@
+# Development Configuration
+# This config is for local testing without SEV-SNP
+
+proxy:
+  listen: "0.0.0.0:26257"  # Listen on all interfaces, port 26257 (CRDB default)
+  backend:
+    # Connect to local CockroachDB on different port for testing
+    host: "localhost"
+    port: 26258  # CRDB runs on 26258 in dev
+    unix_socket: ""  # Leave empty to use TCP
+    tls:
+      enabled: false  # Disable TLS for local dev
+
+attestation:
+  provider: "simulated"  # Use simulated attestation for development
+  policy_file: "config/policy.yaml"
+  nonce_ttl: 300s  # 5 minutes
+
+tokens:
+  sts_url: "http://localhost:9000/token"  # Mock STS for dev
+  token_ttl: 3600s  # 1 hour
+  dpop_enabled: false  # Disable DPoP for dev
+
+logging:
+  level: "debug"  # Verbose logging for development
+  audit_file: "/tmp/atls-proxy-audit.json"
+
+policy:
+  require_fresh_attestation: false  # Relaxed for dev
+  max_attestation_age: 300s  # 5 minutes

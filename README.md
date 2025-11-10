@@ -2,6 +2,47 @@
 
 A Trusted Execution Environment (TEE)-based proxy that enhances TLS 1.3 with hardware-rooted attestation for CockroachDB connections. This proxy ensures **what is running**, not just **who is connecting**, using IETF RATS-compliant attestation and OAuth Token Exchange.
 
+## Quick Start
+
+### 1. Build the Proxy
+
+```bash
+# Clone the repository
+git clone https://github.com/souravcrl/attested-tls-proxy-cockroach.git
+cd attested-tls-proxy-cockroach
+
+# Build the proxy
+make build
+
+# Output: bin/atls-proxy
+```
+
+### 2. Deploy to GCP SEV-SNP VM
+
+```bash
+# Configure Terraform (edit iac/terraform/terraform.tfvars)
+cd iac/terraform
+terraform init
+terraform apply
+
+# Get connection details
+terraform output
+```
+
+### 3. Connect Through Proxy
+
+```bash
+# Use the external IP from terraform output
+PROXY_IP=$(terraform output -raw proxy_external_ip)
+
+# Connect via PostgreSQL client
+psql "postgresql://root@${PROXY_IP}:26257/defaultdb?sslmode=require"
+```
+
+For detailed deployment instructions, see [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
+
+For the complete implementation plan, see [PLAN.md](PLAN.md).
+
 ## Overview
 
 Traditional TLS proves *identity* via certificates. Attested TLS (aTLS) adds *integrity* by having a TEE-hosted proxy present hardware-rooted evidence during the handshake. This allows clients and Identity Providers to verify the exact software running in the proxy before granting access.
@@ -25,20 +66,29 @@ Traditional TLS proves *identity* via certificates. Attested TLS (aTLS) adds *in
 
 ## Architecture
 
+**Full-Stack TEE Deployment:**
+
 ```
-┌─────────┐    aTLS+Auth    ┌──────────────┐   Standard TLS   ┌──────────────┐
-│ Client  │ ───────────────>│  TEE Proxy   │ ───────────────> │  CockroachDB │
-│         │ <───────────────│  (SEV-SNP)   │ <─────────────── │   Backend    │
-└─────────┘                 └──────────────┘                  └──────────────┘
-     │                             │
-     │                             │
-     ▼                             ▼
-┌─────────┐                 ┌──────────────┐
-│Verifier │                 │     STS      │
-│Service  │                 │ (Token Svc)  │
-└─────────┘                 └──────────────┘
-(Veraison/Azure/GCP)        (OAuth Token Exchange)
+┌────────────────── SEV-SNP VM (GCP) ────────────────┐
+│                                                     │
+│  ┌────────┐ localhost ┌──────────────┐            │
+│  │ Proxy  │─────────>│ CockroachDB  │            │
+│  │ :26257 │    TLS   │  :26258      │            │
+│  └────────┘          └──────────────┘            │
+│       ▲                                            │
+│       │ aTLS (Attested TLS)                       │
+└───────┼────────────────────────────────────────────┘
+        │
+   ┌────────┐
+   │ Client │
+   └────────┘
 ```
+
+**Benefits:**
+- Both proxy AND CockroachDB run in same SEV-SNP VM
+- Complete end-to-end attestation of data path
+- No external network exposure for CockroachDB
+- Single attestation covers both components
 
 ### Flow
 
