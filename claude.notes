@@ -1,0 +1,59 @@
+# CockroachDB Status Service Analysis
+
+## Purpose of the Status Server
+The Status service provides comprehensive cluster monitoring, diagnostics, and operational data including:
+- Node health and status reporting
+- Range and replica information
+- Session and query management
+- Performance metrics and diagnostics
+- Certificate and security information
+- Hot ranges and key visualization
+- Job registry and execution details
+- Network connectivity monitoring
+
+Serves both internal operational needs and external monitoring tools.
+
+## Authorization Context
+
+### Authentication Requirements
+- Valid SQL authentication with user identity
+- Identity context propagated across node-to-node calls
+
+### System Privileges (Hierarchical)
+1. **VIEWCLUSTERMETADATA** - Access to:
+   - Node details, ranges, stores
+   - Certificates, engine stats
+   - Cluster topology and metadata
+
+2. **VIEWACTIVITY/VIEWACTIVITYREDACTED** - Access to:
+   - Sessions, queries, contention events
+   - Execution insights
+   - VIEWACTIVITYREDACTED gets sanitized data (SQL constants removed)
+
+3. **VIEWDEBUG** - Access to:
+   - Profiles, stacks, diagnostics
+   - Debugging information
+
+4. **CANCELQUERY** - Ability to:
+   - Cancel queries across different users
+   - Subject to additional checks (can't cancel admin queries if not admin)
+
+5. **REPAIRCLUSTER** - Access to:
+   - Cluster repair operations
+
+### User Access Levels
+1. **Admin users** - Bypass all permission checks, full access to unredacted data
+2. **Privileged users** - Access based on granted system privileges
+3. **Regular users** - Limited access (only their own sessions/queries)
+
+### Security Controls
+- Node-to-node forwarding with identity preservation
+- Automatic redaction of sensitive data for unauthorized users
+- Self-service restrictions for non-privileged users
+- Rate limiting protections against DoS attacks
+
+## Implementation Details
+- **baseStatusServer** - Shared functionality
+- **statusServer** - Standard tenant operations
+- **systemStatusServer** - Enhanced system-level access
+- **privchecker** package - Centralized authorization framework
