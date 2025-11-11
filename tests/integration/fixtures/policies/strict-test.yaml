@@ -1,0 +1,29 @@
+# Strict enforcement policy for testing
+# All checks are enforced and violations will deny access
+
+version: "1.0"
+
+measurements:
+  # Use the test measurement from testclient (TEST_MEASUREMENT_VALID_001 padded to 48 bytes)
+  expected: "544553545f4d4541535552454d454e545f56414c49445f30303100000000000000000000000000000000000000000000"
+  mode: "strict"  # Enforce measurement validation
+
+tcb:
+  min_version: "1.51.0"
+  min_platform_version: 1
+  mode: "strict"  # Enforce TCB version checks
+
+guest:
+  debug_disabled: true   # Debug must be disabled
+  smt_disabled: true     # SMT must be disabled
+  min_guest_svn: 1       # Minimum guest SVN
+  mode: "strict"         # Enforce guest policy
+
+nonce:
+  max_age: "5m"          # Nonce must be fresh within 5 minutes
+  required: true         # Nonce is required
+  min_length: 16         # Minimum nonce length
+
+certificates:
+  verify_chain: false     # Skip certificate chain verification for mock evidence
+  verify_signature: false # Skip signature verification for mock evidence

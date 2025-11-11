@@ -1,0 +1,28 @@
+# Disabled mode policy for testing
+# All verification checks are disabled (permissive mode)
+
+version: "1.0"
+
+measurements:
+  expected: ""
+  mode: "disabled"  # Disable measurement validation
+
+tcb:
+  min_version: "0.0.0"
+  min_platform_version: 0
+  mode: "disabled"  # Disable TCB validation
+
+guest:
+  debug_disabled: false  # Allow debug
+  smt_disabled: false    # Allow SMT
+  min_guest_svn: 0       # No minimum
+  mode: "disabled"       # Disable guest policy
+
+nonce:
+  max_age: "1h"          # Very permissive
+  required: false        # Nonce not required
+  min_length: 0          # No minimum
+
+certificates:
+  verify_chain: false    # Don't verify chain
+  verify_signature: false # Don't verify signature

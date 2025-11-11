@@ -1,0 +1,31 @@
+# Debug allowed policy for testing
+# Allows debug mode for development/testing
+
+version: "1.0"
+
+measurements:
+  # Accept debug measurement
+  allow_list:
+    - "544553545f4d4541535552454d454e545f4445425547000000000000000000000000000000000000000000000000000000000000"
+    - "544553545f4d4541535552454d454e545f56414c49445f30303100000000000000000000000000000000000000000000000000"
+  mode: "strict"
+
+tcb:
+  min_version: "1.51.0"
+  min_platform_version: 1
+  mode: "strict"
+
+guest:
+  debug_disabled: false  # Allow debug mode
+  smt_disabled: true     # Still require SMT disabled
+  min_guest_svn: 1
+  mode: "strict"
+
+nonce:
+  max_age: "5m"
+  required: true
+  min_length: 16
+
+certificates:
+  verify_chain: false     # Relaxed for testing
+  verify_signature: false # Relaxed for testing

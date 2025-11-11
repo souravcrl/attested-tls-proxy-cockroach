@@ -3,7 +3,7 @@ package policy
 import (
 	"bytes"
 	"crypto/ecdsa"
-	"crypto/sha256"
+	"crypto/sha512"
 	"crypto/x509"
 	"encoding/hex"
 	"encoding/pem"
@@ -464,7 +464,7 @@ func (v *Verifier) verifyReportSignature(report *attestation.AttestationReport, 
 	reportData := report.Marshal()[:0x2A0]
 
 	// Hash the report data with SHA-384
-	hash := sha256.New384()
+	hash := sha512.New384()
 	hash.Write(reportData)
 	digest := hash.Sum(nil)
 

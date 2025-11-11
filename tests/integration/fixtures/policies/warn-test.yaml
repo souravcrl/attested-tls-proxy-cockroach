@@ -1,0 +1,29 @@
+# Warning mode policy for testing
+# Violations are logged but do not deny access
+
+version: "1.0"
+
+measurements:
+  # Use the test measurement from testclient
+  expected: "544553545f4d4541535552454d454e545f56414c49445f30303100000000000000000000000000000000000000000000000000"
+  mode: "warn"  # Log warnings but don't enforce
+
+tcb:
+  min_version: "1.51.0"
+  min_platform_version: 1
+  mode: "warn"  # Log warnings but don't enforce
+
+guest:
+  debug_disabled: true   # Prefer debug disabled
+  smt_disabled: true     # Prefer SMT disabled
+  min_guest_svn: 1       # Minimum guest SVN
+  mode: "warn"           # Log warnings but don't enforce
+
+nonce:
+  max_age: "5m"          # Nonce freshness check
+  required: true         # Nonce is required
+  min_length: 16         # Minimum nonce length
+
+certificates:
+  verify_chain: false    # Don't verify chain in warn mode
+  verify_signature: false # Don't verify signature in warn mode
