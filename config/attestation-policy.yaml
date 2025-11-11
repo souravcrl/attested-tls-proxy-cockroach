@@ -1,0 +1,71 @@
+# Attestation Verification Policy
+# This file defines the security requirements for accepting attestation evidence
+
+version: "1.0"
+
+# Measurement verification
+measurements:
+  # Expected measurement hash (SHA-384 of running code)
+  # Generate with: sha384sum /path/to/proxy-binary
+  expected: ""  # Leave empty to use allow_list
+
+  # List of acceptable measurements (for multiple versions)
+  allow_list:
+    - "EXAMPLE_MEASUREMENT_HASH_1"
+    - "EXAMPLE_MEASUREMENT_HASH_2"
+
+  # Enforcement mode: strict (reject), warn (log), disabled
+  mode: "warn"  # Use "strict" in production after setting measurements
+
+# Trusted Computing Base (TCB) version requirements
+tcb:
+  # Minimum TCB version (format: major.minor.build)
+  min_version: "1.51.0"
+
+  # Minimum platform version (optional)
+  min_platform_version: 0
+
+  # Enforcement mode
+  mode: "strict"
+
+# Guest VM policy requirements
+guest:
+  # Debug must be disabled for production
+  debug_disabled: true
+
+  # SMT (Simultaneous Multi-Threading) should be disabled for security
+  smt_disabled: true
+
+  # Minimum guest Security Version Number (optional)
+  min_guest_svn: 0
+
+  # Enforcement mode
+  mode: "strict"
+
+# Nonce validation
+nonce:
+  # Maximum age of attestation evidence
+  max_age: "5m"
+
+  # Nonce is required
+  required: true
+
+  # Minimum nonce length in bytes
+  min_length: 16
+
+# Certificate chain validation
+certificates:
+  # Verify AMD certificate chain (VCEK → ASK → ARK)
+  verify_chain: true
+
+  # Verify signature on attestation report
+  verify_signature: true
+
+  # Trusted AMD ARK certificates (optional)
+  trusted_arks: []
+
+  # Allow cached certificates
+  allow_cached: true
+
+  # Certificate cache duration
+  cache_duration: "1h"
