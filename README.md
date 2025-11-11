@@ -19,6 +19,30 @@ A Trusted Execution Environment (TEE)-based proxy that enhances TLS 1.3 with har
 
 ## 🚀 Quick Start
 
+### 🎬 Live Demo - Attestation Dashboard
+
+![Dashboard Demo](dashboard-demo.gif)
+
+**Try it yourself in 30 seconds:**
+```bash
+# Run the complete cluster demo
+./run-cluster-demo.sh
+
+# Opens dashboard at: http://localhost:9090
+# - 3 CockroachDB nodes
+# - 3 Attested TLS proxies
+# - Real-time attestation dashboard
+# - 10 test clients with attestation records
+```
+
+The dashboard shows:
+- ✅ **Real-time metrics** - Total clients, active connections, proxy nodes
+- ✅ **Attestation analytics** - Measurement distribution (bar chart), proxy distribution (pie chart)
+- ✅ **Audit records** - Full attestation history with pagination
+- ✅ **Auto-refresh** - Live data updates every 5 seconds
+
+---
+
 ### Prerequisites
 
 - **Go 1.21+** - [Install Go](https://go.dev/doc/install)
@@ -27,7 +51,7 @@ A Trusted Execution Environment (TEE)-based proxy that enhances TLS 1.3 with har
 
 **macOS Setup:**
 ```bash
-brew install go openssl@3
+brew install go openssl@3 cockroachdb/tap/cockroach
 export CGO_CFLAGS="-I/opt/homebrew/Cellar/openssl@3/3.5.0/include"
 export CGO_LDFLAGS="-L/opt/homebrew/Cellar/openssl@3/3.5.0/lib -lcrypto"
 ```
@@ -392,6 +416,232 @@ defer env.Cleanup()
 - `warn-test.yaml` - Log violations, don't enforce
 - `disabled-test.yaml` - Skip all checks (dev only)
 - `debug-allowed-test.yaml` - Permit debug mode
+
+---
+
+## 🎯 Cluster Demo - Full Stack Attestation
+
+### Quick Start
+
+The `run-cluster-demo.sh` script sets up a complete attested TLS infrastructure in seconds:
+
+```bash
+# One command to start everything
+./run-cluster-demo.sh
+
+# What gets started:
+# ✅ 3 CockroachDB nodes (ports 26258, 26268, 26278)
+# ✅ 3 Attested TLS proxies (ports 26257, 26267, 26277)
+# ✅ HTTP API servers (ports 8081, 8082, 8083)
+# ✅ Attestation Dashboard (port 9090)
+# ✅ 10 test clients with attestations
+```
+
+### Dashboard Features
+
+**Real-time Monitoring:** http://localhost:9090
+
+![Dashboard Demo](dashboard-demo.gif)
+
+**Metrics Cards:**
+- **Total Clients** - All attestation records across all proxies
+- **Active Connections** - Currently connected clients
+- **Proxy Nodes** - Number of healthy proxy instances
+- **Unique Measurements** - Distinct client configurations
+
+**Visual Analytics:**
+- **Bar Chart** - Client distribution by measurement hash
+- **Pie Chart** - Client distribution by proxy node
+- **Table View** - Complete attestation audit log with pagination
+
+**Auto-Refresh:** Data updates every 5 seconds automatically
+
+### Architecture Overview
+
+```
+┌─────────────────── Cluster Demo Architecture ────────────────────┐
+│                                                                   │
+│  CockroachDB Cluster          Attested TLS Proxies               │
+│  ┌───────────────┐            ┌──────────────┐                   │
+│  │ Node 1:26258  │◄───────────│ Proxy 1:26257│ (API :8081)       │
+│  └───────────────┘            └──────────────┘                   │
+│  ┌───────────────┐            ┌──────────────┐                   │
+│  │ Node 2:26268  │◄───────────│ Proxy 2:26267│ (API :8082)       │
+│  └───────────────┘            └──────────────┘                   │
+│  ┌───────────────┐            ┌──────────────┐                   │
+│  │ Node 3:26278  │◄───────────│ Proxy 3:26277│ (API :8083)       │
+│  └───────────────┘            └──────────────┘                   │
+│                                       │                           │
+│                              ┌────────▼─────────┐                 │
+│                              │   Dashboard      │                 │
+│                              │   :9090          │                 │
+│                              └──────────────────┘                 │
+│                                                                   │
+│  Attestation Storage:                                             │
+│  - /tmp/attestations-node1.db (SQLite)                           │
+│  - /tmp/attestations-node2.db (SQLite)                           │
+│  - /tmp/attestations-node3.db (SQLite)                           │
+└───────────────────────────────────────────────────────────────────┘
+```
+
+### API Endpoints
+
+Each proxy exposes a REST API for querying attestation data:
+
+**Statistics Overview:**
+```bash
+curl http://localhost:8081/api/v1/stats/overview
+```
+```json
+{
+  "proxy_node_id": "proxy-1",
+  "total_attestations": 10,
+  "allowed": 9,
+  "denied": 1,
+  "active_connections": 0,
+  "timestamp": "2025-11-12T03:46:00Z"
+}
+```
+
+**All Attestations:**
+```bash
+curl http://localhost:8081/api/v1/attestations?limit=10
+```
+
+**Recent Attestations:**
+```bash
+curl http://localhost:8081/api/v1/attestations/recent?limit=5
+```
+
+**Active Clients:**
+```bash
+curl http://localhost:8081/api/v1/clients/active
+```
+
+**Denied Clients:**
+```bash
+curl http://localhost:8081/api/v1/clients/denied
+```
+
+**Measurement Statistics:**
+```bash
+curl http://localhost:8081/api/v1/stats/measurements
+```
+
+**Time-based Query:**
+```bash
+curl "http://localhost:8081/api/v1/attestations?since=2025-11-12T00:00:00Z"
+```
+
+### Accessing the Cluster
+
+**Dashboard:**
+- URL: http://localhost:9090
+- Features: Real-time metrics, charts, attestation audit log
+
+**CockroachDB Admin UIs:**
+- Node 1: http://localhost:8091
+- Node 2: http://localhost:8092
+- Node 3: http://localhost:8093
+
+**Proxy API Servers:**
+- Proxy 1: http://localhost:8081/api/v1/stats/overview
+- Proxy 2: http://localhost:8082/api/v1/stats/overview
+- Proxy 3: http://localhost:8083/api/v1/stats/overview
+
+### Running Additional Test Clients
+
+```bash
+# Generate more attestation records
+go run tests/integration/helpers/testclient/connect_to_cluster.go
+
+# Or run multiple clients in a loop
+for i in {1..10}; do
+  go run tests/integration/helpers/testclient/connect_to_cluster.go
+  sleep 2
+done
+
+# Watch dashboard update in real-time at http://localhost:9090
+```
+
+### Viewing Attestation Data
+
+**SQLite Database:**
+```bash
+# Query attestation records directly
+sqlite3 /tmp/attestations-node1.db "SELECT * FROM client_attestations;"
+
+# Count records
+sqlite3 /tmp/attestations-node1.db "SELECT COUNT(*) FROM client_attestations;"
+
+# Recent denied clients
+sqlite3 /tmp/attestations-node1.db \
+  "SELECT client_id, verify_result, verify_reason FROM client_attestations WHERE verify_result='denied';"
+```
+
+**Dashboard API:**
+```bash
+# Aggregated data from all proxies
+curl http://localhost:9090/api/aggregated | jq
+```
+
+### Stopping the Cluster
+
+```bash
+# Gracefully shutdown all services
+# Press Ctrl+C in the terminal running run-cluster-demo.sh
+
+# Or kill specific components
+pkill -f "cockroach|proxy|dashboard"
+
+# Clean up data
+rm -rf cockroach-data /tmp/attestations-node*.db
+```
+
+### Logs
+
+All services log to `/tmp/`:
+- **Proxy Logs:** `/tmp/proxy1.log`, `/tmp/proxy2.log`, `/tmp/proxy3.log`
+- **Dashboard Log:** `/tmp/dashboard.log`
+- **Test Clients:** `/tmp/clients.log`
+- **Demo Script:** `/tmp/demo-run.log`
+
+**View live logs:**
+```bash
+tail -f /tmp/proxy1.log
+tail -f /tmp/dashboard.log
+```
+
+### Troubleshooting
+
+**Dashboard not loading?**
+```bash
+# Check if dashboard is running
+curl http://localhost:9090/api/aggregated
+
+# Check dashboard log
+tail /tmp/dashboard.log
+```
+
+**No data in dashboard?**
+```bash
+# Check if proxies are responding
+curl http://localhost:8081/api/v1/stats/overview
+curl http://localhost:8082/api/v1/stats/overview
+curl http://localhost:8083/api/v1/stats/overview
+
+# Run test clients
+go run tests/integration/helpers/testclient/connect_to_cluster.go
+```
+
+**Port conflicts?**
+```bash
+# Check what's using ports
+lsof -ti:9090,8081,8082,8083,26257,26267,26277
+
+# Kill conflicting processes
+lsof -ti:9090 | xargs kill
+```
 
 ---
 

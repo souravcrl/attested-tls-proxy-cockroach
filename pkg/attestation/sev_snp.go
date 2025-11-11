@@ -89,7 +89,7 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/souravcrl/attested-tls-proxy-cockroach/internal/logger"
+	"github.com/cockroachdb/attested-tls-proxy-cockroach/internal/logger"
 )
 
 // SEVSNPAttester implements the Attester interface using real SEV-SNP hardware

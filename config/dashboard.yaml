@@ -1,0 +1,21 @@
+# Dashboard configuration
+listen: ":9090"
+refresh_interval: 10s
+
+proxy_nodes:
+  - id: "proxy-1"
+    address: "localhost:8080"
+  - id: "proxy-2"
+    address: "localhost:8081"
+  - id: "proxy-3"
+    address: "localhost:8082"
+
+# Note: In production, configure actual proxy node addresses
+# Example for distributed deployment:
+# proxy_nodes:
+#   - id: "proxy-1"
+#     address: "10.0.1.10:8080"
+#   - id: "proxy-2"
+#     address: "10.0.1.11:8080"
+#   - id: "proxy-3"
+#     address: "10.0.1.12:8080"

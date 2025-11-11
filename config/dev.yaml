@@ -2,6 +2,7 @@
 # This config is for local testing without SEV-SNP
 
 proxy:
+  node_id: "dev-proxy-1"  # Unique identifier for this proxy instance
   listen: "0.0.0.0:26257"  # Listen on all interfaces, port 26257 (CRDB default)
   backend:
     # Connect to local CockroachDB on different port for testing
@@ -10,11 +11,17 @@ proxy:
     unix_socket: ""  # Leave empty to use TCP
     tls:
       enabled: false  # Disable TLS for local dev
+  api:
+    enabled: true  # Enable HTTP API for development
+    listen: "0.0.0.0:8080"  # HTTP API server address
 
 attestation:
   provider: "simulated"  # Use simulated attestation for development
   policy_file: "config/policy.yaml"
   nonce_ttl: 300s  # 5 minutes
+  storage:
+    db_path: "/tmp/attestations-dev.db"  # Local SQLite database
+    retention_days: 7  # Keep data for 7 days in dev
 
 tokens:
   sts_url: "http://localhost:9000/token"  # Mock STS for dev

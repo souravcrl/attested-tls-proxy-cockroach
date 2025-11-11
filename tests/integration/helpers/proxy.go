@@ -5,8 +5,8 @@ import (
 	"net"
 	"time"
 
-	"github.com/souravcrl/attested-tls-proxy-cockroach/internal/config"
-	"github.com/souravcrl/attested-tls-proxy-cockroach/pkg/backend"
+	"github.com/cockroachdb/attested-tls-proxy-cockroach/internal/config"
+	"github.com/cockroachdb/attested-tls-proxy-cockroach/pkg/backend"
 )
 
 // TestProxy manages a proxy instance for testing

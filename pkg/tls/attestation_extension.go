@@ -14,8 +14,8 @@ import (
 	"time"
 
 	"github.com/fxamacker/cbor/v2"
-	"github.com/souravcrl/attested-tls-proxy-cockroach/internal/logger"
-	"github.com/souravcrl/attested-tls-proxy-cockroach/pkg/attestation"
+	"github.com/cockroachdb/attested-tls-proxy-cockroach/internal/logger"
+	"github.com/cockroachdb/attested-tls-proxy-cockroach/pkg/attestation"
 )
 
 // Entity Attestation Token (EAT) Implementation

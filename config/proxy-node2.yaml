@@ -1,0 +1,33 @@
+# Proxy Node 2 Configuration
+proxy:
+  node_id: "proxy-2"
+  listen: "0.0.0.0:26267"
+  backend:
+    host: "localhost"
+    port: 26268
+    tls:
+      enabled: false
+  api:
+    enabled: true
+    listen: "0.0.0.0:8082"
+
+attestation:
+  provider: "simulated"
+  policy_file: "config/attestation-policy.yaml"
+  nonce_ttl: 300s
+  storage:
+    db_path: "/tmp/attestations-node2.db"
+    retention_days: 7
+
+tokens:
+  sts_url: "http://localhost:9000/token"
+  token_ttl: 3600s
+  dpop_enabled: false
+
+logging:
+  level: "info"
+  audit_file: "/tmp/atls-proxy-audit-node2.json"
+
+policy:
+  require_fresh_attestation: false
+  max_attestation_age: 300s

@@ -9,8 +9,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/souravcrl/attested-tls-proxy-cockroach/internal/config"
-	"github.com/souravcrl/attested-tls-proxy-cockroach/internal/logger"
+	"github.com/cockroachdb/attested-tls-proxy-cockroach/internal/config"
+	"github.com/cockroachdb/attested-tls-proxy-cockroach/internal/logger"
 )
 
 // ConnectionPool manages backend connections to CockroachDB

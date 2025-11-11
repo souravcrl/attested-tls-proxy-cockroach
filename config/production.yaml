@@ -2,6 +2,7 @@
 # This config is for deployment in GCP SEV-SNP VM with CRDB in same TEE
 
 proxy:
+  node_id: "proxy-1"  # Unique identifier - set per node (proxy-1, proxy-2, etc.)
   listen: "0.0.0.0:26257"  # External clients connect here
   backend:
     # Connect to CockroachDB running on same machine
@@ -14,11 +15,17 @@ proxy:
       ca_cert: "/opt/atls-proxy/certs/ca.crt"
       client_cert: "/opt/atls-proxy/certs/client.proxy_user.crt"
       client_key: "/opt/atls-proxy/certs/client.proxy_user.key"
+  api:
+    enabled: true  # Enable HTTP API for monitoring
+    listen: "0.0.0.0:8080"  # HTTP API server (internal network only)
 
 attestation:
   provider: "sev-snp"  # Real SEV-SNP attestation
   policy_file: "/opt/atls-proxy/policy.yaml"
   nonce_ttl: 300s  # 5 minutes - prevent replay attacks
+  storage:
+    db_path: "/var/lib/atls-proxy/attestations.db"  # Persistent storage
+    retention_days: 90  # Keep attestation data for 90 days
 
 tokens:
   sts_url: "https://sts.example.com/token"  # Replace with actual STS endpoint

@@ -7,9 +7,10 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/souravcrl/attested-tls-proxy-cockroach/internal/config"
-	"github.com/souravcrl/attested-tls-proxy-cockroach/internal/logger"
-	"github.com/souravcrl/attested-tls-proxy-cockroach/pkg/backend"
+	"github.com/cockroachdb/attested-tls-proxy-cockroach/internal/config"
+	"github.com/cockroachdb/attested-tls-proxy-cockroach/internal/logger"
+	"github.com/cockroachdb/attested-tls-proxy-cockroach/pkg/api"
+	"github.com/cockroachdb/attested-tls-proxy-cockroach/pkg/backend"
 )
 
 func main() {
@@ -40,6 +41,21 @@ func main() {
 		logger.Log.Fatal().
 			Err(err).
 			Msg("Failed to create proxy")
+	}
+
+	// Start HTTP API server if enabled
+	if cfg.Proxy.API.Enabled && proxy.GetAttestationStore() != nil {
+		apiServer := api.NewServer(proxy.GetAttestationStore(), cfg.Proxy.NodeID)
+		go func() {
+			logger.Log.Info().
+				Str("address", cfg.Proxy.API.Listen).
+				Msg("Starting HTTP API server")
+			if err := apiServer.Start(cfg.Proxy.API.Listen); err != nil {
+				logger.Log.Error().
+					Err(err).
+					Msg("HTTP API server failed")
+			}
+		}()
 	}
 
 	// Setup signal handling for graceful shutdown

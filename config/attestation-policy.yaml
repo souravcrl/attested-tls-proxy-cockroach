@@ -56,10 +56,10 @@ nonce:
 # Certificate chain validation
 certificates:
   # Verify AMD certificate chain (VCEK → ASK → ARK)
-  verify_chain: true
+  verify_chain: false  # Disabled for simulated attestation
 
   # Verify signature on attestation report
-  verify_signature: true
+  verify_signature: false  # Disabled for simulated attestation
 
   # Trusted AMD ARK certificates (optional)
   trusted_arks: []

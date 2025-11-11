@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/souravcrl/attested-tls-proxy-cockroach/tests/integration/helpers"
-	"github.com/souravcrl/attested-tls-proxy-cockroach/tests/integration/testclient"
+	"github.com/cockroachdb/attested-tls-proxy-cockroach/tests/integration/helpers"
+	"github.com/cockroachdb/attested-tls-proxy-cockroach/tests/integration/testclient"
 )
 
 // TestE2EConnectionForwarding tests that the proxy correctly forwards connections to CRDB after attestation

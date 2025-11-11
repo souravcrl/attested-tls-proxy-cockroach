@@ -1,0 +1,11 @@
+# Dashboard configuration for 3-node cluster
+listen: ":9090"
+refresh_interval: 5s
+
+proxy_nodes:
+  - id: "proxy-1"
+    address: "localhost:8081"
+  - id: "proxy-2"
+    address: "localhost:8082"
+  - id: "proxy-3"
+    address: "localhost:8083"

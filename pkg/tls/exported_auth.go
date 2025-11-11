@@ -13,7 +13,7 @@ import (
 	"hash"
 	"math/big"
 
-	"github.com/souravcrl/attested-tls-proxy-cockroach/internal/logger"
+	"github.com/cockroachdb/attested-tls-proxy-cockroach/internal/logger"
 )
 
 // RFC 9261: Exported Authenticators in TLS

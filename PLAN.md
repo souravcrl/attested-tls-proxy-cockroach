@@ -8,40 +8,97 @@ This document outlines the implementation plan for building a TEE-based attested
 
 ### Understanding the Attestation Scope
 
-#### Phase 1-3: Proxy-Only TEE
+#### Phase 1-3: Distributed Attestation with Centralized Dashboard
 ```
-┌─────────┐   aTLS    ┌──────────────┐   Regular TLS   ┌──────────────┐
-│ Client  │ ────────> │  TEE Proxy   │ ──────────────> │ CockroachDB  │
-│         │           │  (SEV-SNP)   │                 │ (NOT in TEE) │
-└─────────┘           └──────────────┘                 └──────────────┘
-                           ✓ Attested                      ✗ Not Attested
+┌─────────────┐                                    ┌─────────────┐
+│ Client      │                                    │ Client      │
+│ (SEV-SNP)   │                                    │ (SEV-SNP)   │
+└──────┬──────┘                                    └──────┬──────┘
+       │ aTLS (Client attests to Proxy)                  │ aTLS
+       │                                                  │
+       ▼                                                  ▼
+┌──────────────────────┐                    ┌──────────────────────┐
+│   TEE VM 1           │                    │   TEE VM 2           │
+│  ┌───────┐ ┌──────┐ │                    │  ┌───────┐ ┌──────┐ │
+│  │Proxy 1│─│CRDB 1│ │                    │  │Proxy 2│─│CRDB 2│ │
+│  │:26257 │ │:26258│ │                    │  │:26257 │ │:26258│ │
+│  │       │ │      │ │                    │  │       │ │      │ │
+│  │ API   │ │      │ │                    │  │ API   │ │      │ │
+│  │:8080  │ │      │ │                    │  │:8080  │ │      │ │
+│  └───┬───┘ └──────┘ │                    │  └───┬───┘ └──────┘ │
+│      │ Attestation  │                    │      │ Attestation  │
+│      │ Store (Local)│                    │      │ Store (Local)│
+└──────┼──────────────┘                    └──────┼──────────────┘
+       │ HTTP API                                 │ HTTP API
+       │ /api/v1/attestations                     │ /api/v1/attestations
+       │ /api/v1/clients                          │ /api/v1/clients
+       │                                           │
+       └────────────────┬──────────────────────────┘
+                        │ Pull-based queries
+                        ▼
+                ┌─────────────────────┐
+                │  Dashboard (Web UI) │
+                │  - Query all proxies│
+                │  - Aggregate data   │
+                │  - Visualize cluster│
+                └─────────────────────┘
 ```
+
+**Architecture Principles:**
+- **Co-located**: Each CRDB node has its own proxy in the same TEE VM
+- **Local Storage**: Each proxy stores attestation data locally (SQLite/in-memory)
+- **HTTP API**: Each proxy exposes REST API for attestation data
+- **Pull-based**: Dashboard queries all proxy nodes on-demand
+- **Stateless Aggregation**: Dashboard aggregates responses in real-time
 
 **What This Attests:**
-- The proxy code itself - Client verifies unmodified proxy software
-- The proxy's policies - Authentication/authorization logic is proven
-- The connection termination point - Secure channel to verified proxy
+- **Clients**: Client software integrity, measurements, security configuration
+- **Proxy**: Each proxy's software integrity and policy enforcement
+- **CRDB Nodes**: Database node integrity via co-location with attested proxy
+- **Complete Data Path**: End-to-end cryptographic verification
 
 **Protects Against:**
-- Compromised proxy software
-- Man-in-the-middle on client→proxy
-- Proxy policy bypass
-- Token theft
-- Credential exfiltration from proxy
+- Compromised proxy or database software
+- Compromised or unauthorized clients
+- Rogue nodes joining the cluster
+- Man-in-the-middle attacks
+- Policy bypass attempts
+- Unauthorized client connections
 
-**Does NOT Protect Against:**
-- Compromised CockroachDB backend
-- Data tampering at rest
-- Malicious DBA access
-- Memory dumps of CRDB
+**Centralized Monitoring Benefits:**
+- **Unified View**: Dashboard queries all proxies and presents aggregate data
+- **Client Inventory**: Cluster-wide tracking of all connected clients with attestation status
+- **Node Topology**: Visual map of CRDB cluster with per-node health
+- **Historical Data**: Time-series attestation metrics per proxy
+- **Anomaly Detection**: Cluster-wide measurement drift alerts
+- **Real-time**: On-demand queries show current cluster state
+
+**HTTP API Design:**
+```
+GET /api/v1/attestations              # List all attestation events
+GET /api/v1/attestations/{id}         # Get specific attestation
+GET /api/v1/clients                   # List currently connected clients
+GET /api/v1/clients/{id}/attestation  # Get client's attestation details
+GET /api/v1/metrics                   # Prometheus-style metrics
+GET /api/v1/health                    # Proxy health + CRDB status
+```
+
+**Dashboard Features:**
+- Discover proxy nodes (manual config or CRDB node list)
+- Query all proxies in parallel
+- Aggregate and deduplicate client data
+- Show cluster topology (which clients connect to which nodes)
+- Filter by time range, client ID, measurement hash
+- Export compliance reports (CSV, JSON)
 
 **Use Cases:**
-- Compliance gateway with audited access
-- Zero-trust client authentication
-- Token exchange boundary in hardened environment
-- Multi-tenant isolation with cryptographic proof
+- Compliance gateway with comprehensive audit trail
+- Zero-trust client verification before database access
+- Multi-tenant isolation with per-client attestation tracking
+- Secure cluster expansion with automated node verification
+- Real-time security posture monitoring
 
-#### Phase 4: Full-Stack TEE
+#### Phase 4: Full-Stack TEE (Per-Node)
 ```
 ┌─────────┐   aTLS    ┌────────────────────────────────┐
 │ Client  │ ────────> │    SEV-SNP VM (TEE)            │
@@ -2561,6 +2618,756 @@ func main() {
 - [ ] Setup log aggregation (Cloud Logging)
 
 **Deliverable:** Production-ready proxy with observability
+
+---
+
+### 4.4 Client Attestation Storage & HTTP API
+
+**Objective:** Store client attestation data locally and expose HTTP API for dashboard aggregation
+
+**File:** `pkg/attestation/store.go`
+```go
+package attestation
+
+import (
+    "database/sql"
+    "encoding/json"
+    "fmt"
+    "time"
+    _ "github.com/mattn/go-sqlite3"
+)
+
+type AttestationStore struct {
+    db *sql.DB
+}
+
+type ClientAttestation struct {
+    ID             string    `json:"id"`
+    ClientID       string    `json:"client_id"`        // Derived from measurement
+    Measurement    string    `json:"measurement"`       // SHA-384 hex
+    TCBVersion     string    `json:"tcb_version"`
+    DebugEnabled   bool      `json:"debug_enabled"`
+    SMTEnabled     bool      `json:"smt_enabled"`
+    Nonce          string    `json:"nonce"`
+    Timestamp      time.Time `json:"timestamp"`
+    VerifyResult   string    `json:"verify_result"`    // "allowed" or "denied"
+    VerifyReason   string    `json:"verify_reason"`
+    ConnectedAt    time.Time `json:"connected_at"`
+    DisconnectedAt *time.Time `json:"disconnected_at,omitempty"`
+    BytesIn        int64     `json:"bytes_in"`
+    BytesOut       int64     `json:"bytes_out"`
+    ProxyNodeID    string    `json:"proxy_node_id"`    // This proxy's ID
+}
+
+func NewAttestationStore(dbPath string) (*AttestationStore, error) {
+    db, err := sql.Open("sqlite3", dbPath)
+    if err != nil {
+        return nil, err
+    }
+
+    // Create schema
+    _, err = db.Exec(`
+        CREATE TABLE IF NOT EXISTS client_attestations (
+            id TEXT PRIMARY KEY,
+            client_id TEXT NOT NULL,
+            measurement TEXT NOT NULL,
+            tcb_version TEXT,
+            debug_enabled BOOLEAN,
+            smt_enabled BOOLEAN,
+            nonce TEXT,
+            timestamp DATETIME,
+            verify_result TEXT,
+            verify_reason TEXT,
+            connected_at DATETIME,
+            disconnected_at DATETIME,
+            bytes_in INTEGER DEFAULT 0,
+            bytes_out INTEGER DEFAULT 0,
+            proxy_node_id TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_client_id ON client_attestations(client_id);
+        CREATE INDEX IF NOT EXISTS idx_connected_at ON client_attestations(connected_at);
+        CREATE INDEX IF NOT EXISTS idx_verify_result ON client_attestations(verify_result);
+    `)
+    if err != nil {
+        return nil, err
+    }
+
+    return &AttestationStore{db: db}, nil
+}
+
+func (s *AttestationStore) RecordAttestation(att *ClientAttestation) error {
+    _, err := s.db.Exec(`
+        INSERT INTO client_attestations (
+            id, client_id, measurement, tcb_version, debug_enabled, smt_enabled,
+            nonce, timestamp, verify_result, verify_reason, connected_at, proxy_node_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `, att.ID, att.ClientID, att.Measurement, att.TCBVersion, att.DebugEnabled,
+       att.SMTEnabled, att.Nonce, att.Timestamp, att.VerifyResult, att.VerifyReason,
+       att.ConnectedAt, att.ProxyNodeID)
+    return err
+}
+
+func (s *AttestationStore) UpdateConnectionStats(id string, bytesIn, bytesOut int64) error {
+    _, err := s.db.Exec(`
+        UPDATE client_attestations
+        SET bytes_in = ?, bytes_out = ?, disconnected_at = ?
+        WHERE id = ?
+    `, bytesIn, bytesOut, time.Now(), id)
+    return err
+}
+
+func (s *AttestationStore) GetRecentAttestations(limit int) ([]*ClientAttestation, error) {
+    rows, err := s.db.Query(`
+        SELECT id, client_id, measurement, tcb_version, debug_enabled, smt_enabled,
+               nonce, timestamp, verify_result, verify_reason, connected_at,
+               disconnected_at, bytes_in, bytes_out, proxy_node_id
+        FROM client_attestations
+        ORDER BY connected_at DESC
+        LIMIT ?
+    `, limit)
+    if err != nil {
+        return nil, err
+    }
+    defer rows.Close()
+
+    var attestations []*ClientAttestation
+    for rows.Next() {
+        att := &ClientAttestation{}
+        err := rows.Scan(&att.ID, &att.ClientID, &att.Measurement, &att.TCBVersion,
+            &att.DebugEnabled, &att.SMTEnabled, &att.Nonce, &att.Timestamp,
+            &att.VerifyResult, &att.VerifyReason, &att.ConnectedAt,
+            &att.DisconnectedAt, &att.BytesIn, &att.BytesOut, &att.ProxyNodeID)
+        if err != nil {
+            return nil, err
+        }
+        attestations = append(attestations, att)
+    }
+    return attestations, nil
+}
+
+func (s *AttestationStore) GetActiveClients() ([]*ClientAttestation, error) {
+    rows, err := s.db.Query(`
+        SELECT id, client_id, measurement, tcb_version, debug_enabled, smt_enabled,
+               nonce, timestamp, verify_result, verify_reason, connected_at,
+               disconnected_at, bytes_in, bytes_out, proxy_node_id
+        FROM client_attestations
+        WHERE disconnected_at IS NULL AND verify_result = 'allowed'
+        ORDER BY connected_at DESC
+    `)
+    if err != nil {
+        return nil, err
+    }
+    defer rows.Close()
+
+    var clients []*ClientAttestation
+    for rows.Next() {
+        att := &ClientAttestation{}
+        err := rows.Scan(&att.ID, &att.ClientID, &att.Measurement, &att.TCBVersion,
+            &att.DebugEnabled, &att.SMTEnabled, &att.Nonce, &att.Timestamp,
+            &att.VerifyResult, &att.VerifyReason, &att.ConnectedAt,
+            &att.DisconnectedAt, &att.BytesIn, &att.BytesOut, &att.ProxyNodeID)
+        if err != nil {
+            return nil, err
+        }
+        clients = append(clients, att)
+    }
+    return clients, nil
+}
+
+func (s *AttestationStore) GetStatsByMeasurement() (map[string]int, error) {
+    rows, err := s.db.Query(`
+        SELECT measurement, COUNT(*) as count
+        FROM client_attestations
+        WHERE verify_result = 'allowed'
+        GROUP BY measurement
+    `)
+    if err != nil {
+        return nil, err
+    }
+    defer rows.Close()
+
+    stats := make(map[string]int)
+    for rows.Next() {
+        var measurement string
+        var count int
+        if err := rows.Scan(&measurement, &count); err != nil {
+            return nil, err
+        }
+        stats[measurement] = count
+    }
+    return stats, nil
+}
+```
+
+**File:** `pkg/api/http_server.go`
+```go
+package api
+
+import (
+    "encoding/json"
+    "net/http"
+    "strconv"
+    "github.com/souravcrl/attested-tls-proxy-cockroach/pkg/attestation"
+)
+
+type Server struct {
+    store      *attestation.AttestationStore
+    proxyNodeID string
+}
+
+func NewServer(store *attestation.AttestationStore, nodeID string) *Server {
+    return &Server{
+        store:       store,
+        proxyNodeID: nodeID,
+    }
+}
+
+func (s *Server) Start(addr string) error {
+    http.HandleFunc("/api/v1/attestations", s.handleAttestations)
+    http.HandleFunc("/api/v1/clients", s.handleClients)
+    http.HandleFunc("/api/v1/clients/active", s.handleActiveClients)
+    http.HandleFunc("/api/v1/stats/measurements", s.handleMeasurementStats)
+    http.HandleFunc("/api/v1/health", s.handleHealth)
+    http.HandleFunc("/api/v1/node/info", s.handleNodeInfo)
+
+    return http.ListenAndServe(addr, nil)
+}
+
+func (s *Server) handleAttestations(w http.ResponseWriter, r *http.Request) {
+    if r.Method != http.MethodGet {
+        http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+        return
+    }
+
+    limit := 100
+    if limitStr := r.URL.Query().Get("limit"); limitStr != "" {
+        if l, err := strconv.Atoi(limitStr); err == nil {
+            limit = l
+        }
+    }
+
+    attestations, err := s.store.GetRecentAttestations(limit)
+    if err != nil {
+        http.Error(w, err.Error(), http.StatusInternalServerError)
+        return
+    }
+
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(map[string]interface{}{
+        "proxy_node_id": s.proxyNodeID,
+        "count":         len(attestations),
+        "attestations":  attestations,
+    })
+}
+
+func (s *Server) handleClients(w http.ResponseWriter, r *http.Request) {
+    if r.Method != http.MethodGet {
+        http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+        return
+    }
+
+    // Get client ID from URL if specified
+    clientID := r.URL.Query().Get("client_id")
+    if clientID != "" {
+        // TODO: Implement GetByClientID
+        http.Error(w, "Not implemented", http.StatusNotImplemented)
+        return
+    }
+
+    attestations, err := s.store.GetRecentAttestations(100)
+    if err != nil {
+        http.Error(w, err.Error(), http.StatusInternalServerError)
+        return
+    }
+
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(map[string]interface{}{
+        "proxy_node_id": s.proxyNodeID,
+        "clients":       attestations,
+    })
+}
+
+func (s *Server) handleActiveClients(w http.ResponseWriter, r *http.Request) {
+    if r.Method != http.MethodGet {
+        http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+        return
+    }
+
+    clients, err := s.store.GetActiveClients()
+    if err != nil {
+        http.Error(w, err.Error(), http.StatusInternalServerError)
+        return
+    }
+
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(map[string]interface{}{
+        "proxy_node_id": s.proxyNodeID,
+        "count":         len(clients),
+        "active_clients": clients,
+    })
+}
+
+func (s *Server) handleMeasurementStats(w http.ResponseWriter, r *http.Request) {
+    if r.Method != http.MethodGet {
+        http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+        return
+    }
+
+    stats, err := s.store.GetStatsByMeasurement()
+    if err != nil {
+        http.Error(w, err.Error(), http.StatusInternalServerError)
+        return
+    }
+
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(map[string]interface{}{
+        "proxy_node_id": s.proxyNodeID,
+        "measurements":  stats,
+    })
+}
+
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(map[string]interface{}{
+        "status":        "healthy",
+        "proxy_node_id": s.proxyNodeID,
+    })
+}
+
+func (s *Server) handleNodeInfo(w http.ResponseWriter, r *http.Request) {
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(map[string]interface{}{
+        "node_id":   s.proxyNodeID,
+        "version":   "1.0.0", // TODO: Get from build info
+        "timestamp": time.Now(),
+    })
+}
+```
+
+**Configuration Update:** `config/proxy.yaml`
+```yaml
+proxy:
+  listen: "0.0.0.0:26257"
+  node_id: "proxy-1"  # Unique identifier for this proxy node
+  backend:
+    host: "localhost"
+    port: 26258
+
+attestation:
+  provider: "sev-snp"
+  policy_file: "/etc/atls-proxy/policy.yaml"
+  storage:
+    db_path: "/var/lib/atls-proxy/attestations.db"
+    retention_days: 90
+
+api:
+  listen: "0.0.0.0:8080"
+  enabled: true
+```
+
+**Integration into Proxy:** `pkg/backend/proxy.go` (updated)
+```go
+func (p *Proxy) handleConnection(clientConn *tls.Conn) {
+    // 1. Get client certificate
+    clientCert := clientConn.ConnectionState().PeerCertificates[0]
+
+    // 2. Extract attestation from client certificate
+    eat, err := tlsext.ExtractAttestationExtension(clientCert)
+    if err != nil {
+        log.Error("No attestation in certificate", err)
+        return
+    }
+
+    // 3. Verify attestation
+    verifyResult, err := p.verifier.VerifyAttestation(eat)
+
+    // 4. Record attestation in local store
+    clientAtt := &attestation.ClientAttestation{
+        ID:           uuid.New().String(),
+        ClientID:     hex.EncodeToString(eat.Measurements.Application[:8]), // Use first 8 bytes as ID
+        Measurement:  hex.EncodeToString(eat.Measurements.Application),
+        TCBVersion:   eat.TCBVersion,
+        DebugEnabled: eat.Report.IsDebugEnabled(),
+        SMTEnabled:   eat.Report.IsSMTEnabled(),
+        Nonce:        hex.EncodeToString(eat.Nonce),
+        Timestamp:    time.Unix(eat.Timestamp, 0),
+        VerifyResult: "denied",
+        VerifyReason: "Unknown",
+        ConnectedAt:  time.Now(),
+        ProxyNodeID:  p.config.NodeID,
+    }
+
+    if verifyResult.Allowed {
+        clientAtt.VerifyResult = "allowed"
+        clientAtt.VerifyReason = verifyResult.Reason
+    } else {
+        clientAtt.VerifyResult = "denied"
+        clientAtt.VerifyReason = verifyResult.Reason
+    }
+
+    if err := p.attestationStore.RecordAttestation(clientAtt); err != nil {
+        log.Error("Failed to record attestation", err)
+    }
+
+    if !verifyResult.Allowed {
+        return // Reject connection
+    }
+
+    // 5. Connect to backend and track stats
+    backendConn, err := p.backend.Get()
+    if err != nil {
+        log.Error("Failed to connect to backend", err)
+        return
+    }
+
+    // 6. Forward traffic and track bytes
+    bytesIn, bytesOut := p.forwardTraffic(clientConn, backendConn)
+
+    // 7. Update connection stats on disconnect
+    p.attestationStore.UpdateConnectionStats(clientAtt.ID, bytesIn, bytesOut)
+}
+```
+
+**Tasks:**
+- [ ] Implement SQLite-based attestation storage
+- [ ] Create HTTP API endpoints for attestation data
+- [ ] Add data retention policies
+- [ ] Implement pagination for large result sets
+- [ ] Add filtering by time range, measurement, verify result
+- [ ] Track connection statistics (bytes in/out, duration)
+- [ ] Add index on frequently queried fields
+
+**Deliverable:** Local attestation storage with HTTP API for remote queries
+
+---
+
+### 4.5 Centralized Dashboard for Cluster-Wide Attestation
+
+**Objective:** Build web dashboard that queries all proxy nodes and aggregates attestation data
+
+**File:** `cmd/dashboard/main.go`
+```go
+package main
+
+import (
+    "encoding/json"
+    "fmt"
+    "net/http"
+    "sync"
+    "time"
+)
+
+type ProxyNode struct {
+    ID      string `json:"id"`
+    Address string `json:"address"`
+    Healthy bool   `json:"healthy"`
+}
+
+type AggregatedData struct {
+    TotalClients        int                            `json:"total_clients"`
+    ActiveClients       int                            `json:"active_clients"`
+    AttestationsByProxy map[string]int                 `json:"attestations_by_proxy"`
+    MeasurementStats    map[string]int                 `json:"measurement_stats"`
+    Clients             []ClientAttestationWithProxy   `json:"clients"`
+    LastUpdated         time.Time                      `json:"last_updated"`
+}
+
+type ClientAttestationWithProxy struct {
+    ClientAttestation
+    ProxyAddress string `json:"proxy_address"`
+}
+
+type Dashboard struct {
+    proxyNodes []ProxyNode
+    cache      *AggregatedData
+    cacheMutex sync.RWMutex
+}
+
+func NewDashboard(nodes []ProxyNode) *Dashboard {
+    return &Dashboard{
+        proxyNodes: nodes,
+        cache:      &AggregatedData{},
+    }
+}
+
+func (d *Dashboard) Start() {
+    // Refresh data every 10 seconds
+    go d.refreshLoop()
+
+    // Start HTTP server
+    http.HandleFunc("/", d.handleIndex)
+    http.HandleFunc("/api/aggregated", d.handleAggregated)
+    http.HandleFunc("/api/topology", d.handleTopology)
+
+    fmt.Println("Dashboard listening on :9090")
+    http.ListenAndServe(":9090", nil)
+}
+
+func (d *Dashboard) refreshLoop() {
+    ticker := time.NewTicker(10 * time.Second)
+    defer ticker.Stop()
+
+    for {
+        d.refreshData()
+        <-ticker.C
+    }
+}
+
+func (d *Dashboard) refreshData() {
+    var wg sync.WaitGroup
+    var mutex sync.Mutex
+
+    aggregated := &AggregatedData{
+        AttestationsByProxy: make(map[string]int),
+        MeasurementStats:    make(map[string]int),
+        Clients:             []ClientAttestationWithProxy{},
+        LastUpdated:         time.Now(),
+    }
+
+    // Query all proxy nodes in parallel
+    for _, node := range d.proxyNodes {
+        wg.Add(1)
+        go func(n ProxyNode) {
+            defer wg.Done()
+
+            // Query active clients from this proxy
+            resp, err := http.Get(fmt.Sprintf("http://%s/api/v1/clients/active", n.Address))
+            if err != nil {
+                fmt.Printf("Failed to query proxy %s: %v\n", n.ID, err)
+                return
+            }
+            defer resp.Body.Close()
+
+            var result struct {
+                ProxyNodeID   string                `json:"proxy_node_id"`
+                Count         int                   `json:"count"`
+                ActiveClients []ClientAttestation   `json:"active_clients"`
+            }
+
+            if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+                fmt.Printf("Failed to decode response from %s: %v\n", n.ID, err)
+                return
+            }
+
+            // Aggregate data
+            mutex.Lock()
+            aggregated.AttestationsByProxy[n.ID] = result.Count
+            aggregated.TotalClients += result.Count
+            aggregated.ActiveClients += result.Count
+
+            for _, client := range result.ActiveClients {
+                aggregated.Clients = append(aggregated.Clients, ClientAttestationWithProxy{
+                    ClientAttestation: client,
+                    ProxyAddress:      n.Address,
+                })
+
+                // Aggregate measurement stats
+                if count, ok := aggregated.MeasurementStats[client.Measurement]; ok {
+                    aggregated.MeasurementStats[client.Measurement] = count + 1
+                } else {
+                    aggregated.MeasurementStats[client.Measurement] = 1
+                }
+            }
+            mutex.Unlock()
+        }(node)
+    }
+
+    wg.Wait()
+
+    // Update cache
+    d.cacheMutex.Lock()
+    d.cache = aggregated
+    d.cacheMutex.Unlock()
+}
+
+func (d *Dashboard) handleAggregated(w http.ResponseWriter, r *http.Request) {
+    d.cacheMutex.RLock()
+    data := d.cache
+    d.cacheMutex.RUnlock()
+
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(data)
+}
+
+func (d *Dashboard) handleTopology(w http.ResponseWriter, r *http.Request) {
+    // Return cluster topology (proxy nodes and their clients)
+    d.cacheMutex.RLock()
+    defer d.cacheMutex.RUnlock()
+
+    topology := map[string]interface{}{
+        "nodes":   d.proxyNodes,
+        "clients": d.cache.Clients,
+    }
+
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(topology)
+}
+
+func (d *Dashboard) handleIndex(w http.ResponseWriter, r *http.Request) {
+    // Serve HTML dashboard
+    html := `
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Attestation Dashboard</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        .stats { display: flex; gap: 20px; margin-bottom: 20px; }
+        .stat-card { background: #f0f0f0; padding: 20px; border-radius: 5px; }
+        .stat-card h3 { margin-top: 0; }
+        .stat-card .value { font-size: 2em; font-weight: bold; }
+        table { width: 100%; border-collapse: collapse; }
+        th, td { padding: 10px; text-align: left; border-bottom: 1px solid #ddd; }
+        th { background-color: #4CAF50; color: white; }
+        .allowed { color: green; }
+        .denied { color: red; }
+    </style>
+</head>
+<body>
+    <h1>Cluster Attestation Dashboard</h1>
+
+    <div class="stats">
+        <div class="stat-card">
+            <h3>Total Clients</h3>
+            <div class="value" id="totalClients">-</div>
+        </div>
+        <div class="stat-card">
+            <h3>Active Connections</h3>
+            <div class="value" id="activeClients">-</div>
+        </div>
+        <div class="stat-card">
+            <h3>Proxy Nodes</h3>
+            <div class="value" id="proxyNodes">-</div>
+        </div>
+    </div>
+
+    <h2>Active Clients by Measurement</h2>
+    <canvas id="measurementChart" width="400" height="200"></canvas>
+
+    <h2>Connected Clients</h2>
+    <table id="clientsTable">
+        <thead>
+            <tr>
+                <th>Client ID</th>
+                <th>Measurement</th>
+                <th>TCB Version</th>
+                <th>Debug</th>
+                <th>Connected At</th>
+                <th>Proxy Node</th>
+                <th>Status</th>
+            </tr>
+        </thead>
+        <tbody></tbody>
+    </table>
+
+    <script>
+        function updateDashboard() {
+            fetch('/api/aggregated')
+                .then(r => r.json())
+                .then(data => {
+                    document.getElementById('totalClients').textContent = data.total_clients;
+                    document.getElementById('activeClients').textContent = data.active_clients;
+                    document.getElementById('proxyNodes').textContent = Object.keys(data.attestations_by_proxy).length;
+
+                    // Update measurement chart
+                    const labels = Object.keys(data.measurement_stats);
+                    const values = Object.values(data.measurement_stats);
+
+                    new Chart(document.getElementById('measurementChart'), {
+                        type: 'bar',
+                        data: {
+                            labels: labels.map(l => l.substring(0, 12) + '...'),
+                            datasets: [{
+                                label: 'Clients by Measurement',
+                                data: values,
+                                backgroundColor: 'rgba(75, 192, 192, 0.6)'
+                            }]
+                        }
+                    });
+
+                    // Update clients table
+                    const tbody = document.querySelector('#clientsTable tbody');
+                    tbody.innerHTML = '';
+                    data.clients.forEach(client => {
+                        const row = tbody.insertRow();
+                        row.innerHTML = \`
+                            <td>\${client.client_id}</td>
+                            <td>\${client.measurement.substring(0, 16)}...</td>
+                            <td>\${client.tcb_version}</td>
+                            <td>\${client.debug_enabled ? 'Yes' : 'No'}</td>
+                            <td>\${new Date(client.connected_at).toLocaleString()}</td>
+                            <td>\${client.proxy_address}</td>
+                            <td class="\${client.verify_result}">\${client.verify_result}</td>
+                        \`;
+                    });
+                });
+        }
+
+        // Update every 10 seconds
+        updateDashboard();
+        setInterval(updateDashboard, 10000);
+    </script>
+</body>
+</html>
+    `
+    w.Header().Set("Content-Type", "text/html")
+    w.Write([]byte(html))
+}
+
+func main() {
+    // Configure proxy nodes to query
+    nodes := []ProxyNode{
+        {ID: "proxy-1", Address: "10.0.1.10:8080", Healthy: true},
+        {ID: "proxy-2", Address: "10.0.1.11:8080", Healthy: true},
+        {ID: "proxy-3", Address: "10.0.1.12:8080", Healthy: true},
+    }
+
+    dashboard := NewDashboard(nodes)
+    dashboard.Start()
+}
+```
+
+**Configuration:** `config/dashboard.yaml`
+```yaml
+dashboard:
+  listen: ":9090"
+  refresh_interval: 10s
+
+  proxy_nodes:
+    - id: "proxy-1"
+      address: "10.0.1.10:8080"
+    - id: "proxy-2"
+      address: "10.0.1.11:8080"
+    - id: "proxy-3"
+      address: "10.0.1.12:8080"
+
+  # Auto-discover nodes from CRDB cluster (optional)
+  auto_discovery:
+    enabled: true
+    crdb_sql_url: "postgresql://root@localhost:26257/defaultdb"
+    query: "SELECT node_id, address FROM crdb_internal.gossip_nodes"
+```
+
+**Tasks:**
+- [ ] Implement parallel HTTP queries to all proxy nodes
+- [ ] Aggregate attestation data from multiple proxies
+- [ ] Build web UI with real-time updates
+- [ ] Add visualization for measurement distribution
+- [ ] Show cluster topology (which clients connect to which nodes)
+- [ ] Implement auto-discovery of proxy nodes from CRDB cluster
+- [ ] Add filtering and search capabilities
+- [ ] Export compliance reports (CSV, JSON, PDF)
+- [ ] Add alerting for policy violations
+
+**Deliverable:** Centralized dashboard with cluster-wide attestation visibility
+
+**Success Criteria:**
+- Dashboard queries all proxy nodes in <1 second
+- Real-time updates every 10 seconds
+- Shows active clients across entire cluster
+- Visualizes measurement distribution
+- Exports compliance reports
 
 ---
 

@@ -5,8 +5,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/souravcrl/attested-tls-proxy-cockroach/internal/config"
-	"github.com/souravcrl/attested-tls-proxy-cockroach/tests/integration/testclient"
+	"github.com/cockroachdb/attested-tls-proxy-cockroach/internal/config"
+	"github.com/cockroachdb/attested-tls-proxy-cockroach/tests/integration/testclient"
 )
 
 // TestEnv holds the complete test environment

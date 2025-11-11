@@ -15,8 +15,8 @@ import (
 
 	_ "github.com/lib/pq" // PostgreSQL driver for CockroachDB
 
-	"github.com/souravcrl/attested-tls-proxy-cockroach/pkg/attestation"
-	tlsext "github.com/souravcrl/attested-tls-proxy-cockroach/pkg/tls"
+	"github.com/cockroachdb/attested-tls-proxy-cockroach/pkg/attestation"
+	tlsext "github.com/cockroachdb/attested-tls-proxy-cockroach/pkg/tls"
 )
 
 // TestClient is a test client that can connect to the proxy with attestation

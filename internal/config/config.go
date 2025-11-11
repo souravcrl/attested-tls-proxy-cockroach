@@ -19,8 +19,16 @@ type Config struct {
 
 // ProxyConfig defines proxy listener and backend settings
 type ProxyConfig struct {
+	NodeID  string        `yaml:"node_id"` // Unique identifier for this proxy node
 	Listen  string        `yaml:"listen"`
 	Backend BackendConfig `yaml:"backend"`
+	API     APIConfig     `yaml:"api"`
+}
+
+// APIConfig defines HTTP API server settings
+type APIConfig struct {
+	Listen  string `yaml:"listen"`
+	Enabled bool   `yaml:"enabled"`
 }
 
 // BackendConfig defines CockroachDB backend connection settings
@@ -45,6 +53,13 @@ type AttestationConfig struct {
 	Provider   string        `yaml:"provider"` // "sev-snp" or "simulated" (dev only)
 	PolicyFile string        `yaml:"policy_file"`
 	NonceTTL   time.Duration `yaml:"nonce_ttl"`
+	Storage    StorageConfig `yaml:"storage"`
+}
+
+// StorageConfig defines attestation storage settings
+type StorageConfig struct {
+	DBPath        string `yaml:"db_path"`
+	RetentionDays int    `yaml:"retention_days"`
 }
 
 // TokensConfig defines OAuth Token Exchange settings

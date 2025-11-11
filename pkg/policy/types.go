@@ -3,7 +3,7 @@ package policy
 import (
 	"time"
 
-	"github.com/souravcrl/attested-tls-proxy-cockroach/pkg/attestation"
+	"github.com/cockroachdb/attested-tls-proxy-cockroach/pkg/attestation"
 )
 
 // Policy defines the attestation verification policy

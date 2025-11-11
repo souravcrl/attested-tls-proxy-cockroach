@@ -3,6 +3,7 @@ package backend
 import (
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net"
@@ -10,25 +11,60 @@ import (
 	"sync"
 	"time"
 
-	"github.com/souravcrl/attested-tls-proxy-cockroach/internal/config"
-	"github.com/souravcrl/attested-tls-proxy-cockroach/internal/logger"
-	"github.com/souravcrl/attested-tls-proxy-cockroach/pkg/attestation"
-	"github.com/souravcrl/attested-tls-proxy-cockroach/pkg/policy"
-	tlsext "github.com/souravcrl/attested-tls-proxy-cockroach/pkg/tls"
+	"github.com/cockroachdb/attested-tls-proxy-cockroach/internal/config"
+	"github.com/cockroachdb/attested-tls-proxy-cockroach/internal/logger"
+	"github.com/cockroachdb/attested-tls-proxy-cockroach/pkg/attestation"
+	"github.com/cockroachdb/attested-tls-proxy-cockroach/pkg/policy"
+	tlsext "github.com/cockroachdb/attested-tls-proxy-cockroach/pkg/tls"
 )
 
 // Proxy represents the TLS proxy server
 type Proxy struct {
-	config      *config.Config
-	listener    net.Listener
-	pool        *ConnectionPool
-	activeConns sync.WaitGroup
-	shutdown    chan struct{}
-	mu          sync.Mutex
-	running     bool
-	verifier    *policy.Verifier
-	attester    attestation.Attester
-	tlsConfig   *tls.Config
+	config            *config.Config
+	listener          net.Listener
+	pool              *ConnectionPool
+	activeConns       sync.WaitGroup
+	shutdown          chan struct{}
+	mu                sync.Mutex
+	running           bool
+	verifier          *policy.Verifier
+	attester          attestation.Attester
+	tlsConfig         *tls.Config
+	attestationStore  *attestation.AttestationStore
+	connectionStats   map[string]*ConnectionStats
+	statsMutex        sync.RWMutex
+	attestationIDMap  sync.Map // Maps client address -> attestation ID
+}
+
+// ConnectionStats tracks bytes transferred for a connection
+type ConnectionStats struct {
+	BytesIn       int64
+	BytesOut      int64
+	ClientID      string
+	AttestationID string
+}
+
+// countingConn wraps a net.Conn to count bytes read/written
+type countingConn struct {
+	net.Conn
+	bytesRead    *int64
+	bytesWritten *int64
+}
+
+func (c *countingConn) Read(b []byte) (int, error) {
+	n, err := c.Conn.Read(b)
+	if n > 0 {
+		*c.bytesRead += int64(n)
+	}
+	return n, err
+}
+
+func (c *countingConn) Write(b []byte) (int, error) {
+	n, err := c.Conn.Write(b)
+	if n > 0 {
+		*c.bytesWritten += int64(n)
+	}
+	return n, err
 }
 
 // NewProxy creates a new proxy instance
@@ -67,8 +103,24 @@ func NewProxy(cfg *config.Config) (*Proxy, error) {
 		return nil, fmt.Errorf("failed to create attester: %w", err)
 	}
 
+	// Create attestation store if storage is configured
+	var store *attestation.AttestationStore
+	if cfg.Attestation.Storage.DBPath != "" {
+		store, err = attestation.NewAttestationStore(cfg.Attestation.Storage.DBPath)
+		if err != nil {
+			logger.Log.Warn().
+				Err(err).
+				Str("db_path", cfg.Attestation.Storage.DBPath).
+				Msg("Failed to create attestation store, continuing without storage")
+		} else {
+			logger.Log.Info().
+				Str("db_path", cfg.Attestation.Storage.DBPath).
+				Msg("Attestation store initialized")
+		}
+	}
+
 	// Create TLS configuration for accepting client connections
-	tlsConfig, err := createTLSConfigWithVerifier(cfg, verifier)
+	tlsConfig, err := createTLSConfigWithVerifier(cfg, verifier, store, cfg.Proxy.NodeID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create TLS config: %w", err)
 	}
@@ -76,15 +128,18 @@ func NewProxy(cfg *config.Config) (*Proxy, error) {
 	logger.Log.Info().
 		Str("provider", cfg.Attestation.Provider).
 		Bool("tls_mutual_auth", tlsConfig != nil && tlsConfig.ClientAuth == tls.RequireAnyClientCert).
+		Bool("attestation_storage", store != nil).
 		Msg("Proxy initialized with attestation support")
 
 	return &Proxy{
-		config:    cfg,
-		pool:      pool,
-		shutdown:  make(chan struct{}),
-		verifier:  verifier,
-		attester:  attester,
-		tlsConfig: tlsConfig,
+		config:           cfg,
+		pool:             pool,
+		shutdown:         make(chan struct{}),
+		verifier:         verifier,
+		attester:         attester,
+		tlsConfig:        tlsConfig,
+		attestationStore: store,
+		connectionStats:  make(map[string]*ConnectionStats),
 	}, nil
 }
 
@@ -188,6 +243,9 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 		Str("client", clientAddr).
 		Msg("New client connection")
 
+	var attestationID string
+	var clientID string
+
 	// If TLS is enabled, perform handshake (attestation verified via VerifyPeerCertificate callback)
 	if tlsConn, ok := clientConn.(*tls.Conn); ok {
 		// Perform TLS handshake
@@ -206,6 +264,22 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 			Str("client", clientAddr).
 			Int("peer_certs", len(state.PeerCertificates)).
 			Msg("TLS handshake completed successfully with verified attestation")
+
+		// Extract attestation to get client ID for tracking
+		if len(state.PeerCertificates) > 0 {
+			if evidence, err := tlsext.ExtractAttestationExtension(state.PeerCertificates[0]); err == nil {
+				// Use first 8 bytes of measurement as client ID (matching CreateAttestationFromEvidence)
+				measurementHex := hex.EncodeToString(evidence.Report.Measurement[:])
+				clientID = measurementHex[:16] // First 8 bytes (16 hex chars)
+				// Try to find the attestation ID from the store
+				if p.attestationStore != nil {
+					// Query for the most recent attestation with this measurement
+					if attestations, err := p.attestationStore.GetByClientID(clientID); err == nil && len(attestations) > 0 {
+						attestationID = attestations[0].ID
+					}
+				}
+			}
+		}
 	} else {
 		logger.Log.Warn().
 			Str("client", clientAddr).
@@ -233,18 +307,24 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 		Str("client", clientAddr).
 		Msg("Attestation verified - connected to backend, starting bidirectional forwarding")
 
+	// Track bytes transferred
+	var bytesClientToBackend int64
+	var bytesBackendToClient int64
+
 	// Create channels for goroutine coordination
 	done := make(chan error, 2)
 
-	// Forward client -> backend
+	// Forward client -> backend (counting bytes in)
 	go func() {
-		_, err := io.Copy(backendConn, clientConn)
+		n, err := io.Copy(backendConn, clientConn)
+		bytesClientToBackend = n
 		done <- err
 	}()
 
-	// Forward backend -> client
+	// Forward backend -> client (counting bytes out)
 	go func() {
-		_, err := io.Copy(clientConn, backendConn)
+		n, err := io.Copy(clientConn, backendConn)
+		bytesBackendToClient = n
 		done <- err
 	}()
 
@@ -268,6 +348,25 @@ func (p *Proxy) handleConnection(clientConn net.Conn) {
 
 	// Wait for the other goroutine
 	<-done
+
+	// Update connection stats in store
+	if p.attestationStore != nil && attestationID != "" {
+		if err := p.attestationStore.UpdateConnectionStats(attestationID, bytesClientToBackend, bytesBackendToClient); err != nil {
+			logger.Log.Error().
+				Err(err).
+				Str("attestation_id", attestationID).
+				Int64("bytes_in", bytesClientToBackend).
+				Int64("bytes_out", bytesBackendToClient).
+				Msg("Failed to update connection statistics")
+		} else {
+			logger.Log.Debug().
+				Str("attestation_id", attestationID).
+				Str("client_id", clientID).
+				Int64("bytes_in", bytesClientToBackend).
+				Int64("bytes_out", bytesBackendToClient).
+				Msg("Connection statistics updated")
+		}
+	}
 }
 
 // verifyClientAttestation extracts and verifies attestation from client certificate
@@ -350,6 +449,11 @@ func (p *Proxy) verifyClientAttestation(tlsConn *tls.Conn, clientAddr string) bo
 	return true
 }
 
+// GetAttestationStore returns the attestation store for API access
+func (p *Proxy) GetAttestationStore() *attestation.AttestationStore {
+	return p.attestationStore
+}
+
 // isRunning checks if the proxy is running
 func (p *Proxy) isRunning() bool {
 	p.mu.Lock()
@@ -358,7 +462,7 @@ func (p *Proxy) isRunning() bool {
 }
 
 // createTLSConfigWithVerifier creates TLS configuration for the proxy with attestation verification
-func createTLSConfigWithVerifier(cfg *config.Config, verifier *policy.Verifier) (*tls.Config, error) {
+func createTLSConfigWithVerifier(cfg *config.Config, verifier *policy.Verifier, store *attestation.AttestationStore, nodeID string) (*tls.Config, error) {
 	// Generate a self-signed server certificate for testing
 	// In production, you would load real server certificates here
 	certPEM, keyPEM, err := tlsext.GenerateTestCertificate("localhost")
@@ -428,6 +532,17 @@ func createTLSConfigWithVerifier(cfg *config.Config, verifier *policy.Verifier) 
 					}
 				}
 
+				// Record denied attestation in store if available
+				if store != nil {
+					attestationRecord := attestation.CreateAttestationFromEvidence(evidence, "denied", result.Reason, nodeID)
+					if err := store.RecordAttestation(attestationRecord); err != nil {
+						logger.Log.Error().
+							Err(err).
+							Str("client_id", attestationRecord.ClientID).
+							Msg("Failed to record denied attestation in store")
+					}
+				}
+
 				return fmt.Errorf("attestation verification failed: %s", result.Reason)
 			}
 
@@ -436,6 +551,22 @@ func createTLSConfigWithVerifier(cfg *config.Config, verifier *policy.Verifier) 
 				Int("checks_passed", len(result.Checks)).
 				Str("tcb_version", evidence.Report.GetTCBVersion()).
 				Msg("Attestation verification ALLOWED during handshake")
+
+			// Record attestation in store if available
+			if store != nil {
+				attestationRecord := attestation.CreateAttestationFromEvidence(evidence, "allowed", result.Reason, nodeID)
+				if err := store.RecordAttestation(attestationRecord); err != nil {
+					logger.Log.Error().
+						Err(err).
+						Str("client_id", attestationRecord.ClientID).
+						Msg("Failed to record attestation in store")
+				} else {
+					logger.Log.Debug().
+						Str("client_id", attestationRecord.ClientID).
+						Str("measurement", attestationRecord.Measurement).
+						Msg("Attestation recorded in store")
+				}
+			}
 
 			return nil
 		},

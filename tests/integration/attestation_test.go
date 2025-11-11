@@ -3,8 +3,8 @@ package integration
 import (
 	"testing"
 
-	"github.com/souravcrl/attested-tls-proxy-cockroach/tests/integration/helpers"
-	"github.com/souravcrl/attested-tls-proxy-cockroach/tests/integration/testclient"
+	"github.com/cockroachdb/attested-tls-proxy-cockroach/tests/integration/helpers"
+	"github.com/cockroachdb/attested-tls-proxy-cockroach/tests/integration/testclient"
 )
 
 // TestValidAttestation tests that a client with valid attestation can connect
