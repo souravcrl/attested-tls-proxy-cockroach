@@ -4,7 +4,11 @@
 
 This document shows exactly where TLS attestation happens in the code and what's implemented vs. what's planned.
 
-## ✅ IMPLEMENTED (Phase 2.1 - SEV-SNP Attestation)
+## ✅ IMPLEMENTED
+
+### Phase 2.1 - SEV-SNP Attestation
+### Phase 2.2 - RFC 9261 Exported Authenticators
+### Phase 2.3 - Attestation in X.509 Certificate Extensions
 
 ### 1. Attestation Data Structures
 
@@ -143,48 +147,142 @@ func NewAttester(provider string) (Attester, error) {
 }
 ```
 
+### 6. RFC 9261 Exported Authenticators
+
+**File:** `pkg/tls/exported_auth.go` (574 lines)
+
+```go
+// Generate authenticator request
+func GenerateAuthenticatorRequest(conn *tls.Conn, extensions []Extension) (*AuthenticatorRequest, error) {
+    context := make([]byte, 32)
+    rand.Read(context)  // Unique per request
+    return &AuthenticatorRequest{CertificateRequestContext: context, Extensions: extensions}
+}
+
+// Generate authenticator (binds attestation to TLS session)
+func GenerateAuthenticator(conn *tls.Conn, request *AuthenticatorRequest,
+    cert *x509.Certificate, privateKey crypto.PrivateKey) ([]byte, error) {
+
+    // Build Certificate message
+    certMsg := buildCertificateMessage(request.CertificateRequestContext, cert)
+
+    // Export session-specific keys (THIS IS THE KEY BINDING!)
+    exportedKey, _ := conn.ConnectionState().ExportKeyingMaterial(
+        ExporterLabelAuthenticator, handshakeContext, 32)
+
+    // Sign with exported keys
+    certVerify, _ := buildCertificateVerify(privateKey, handshakeContext, exportedKey)
+    return encodeAuthenticator(certMsg, certVerify)
+}
+
+// Verify authenticator
+func VerifyAuthenticator(conn *tls.Conn, request *AuthenticatorRequest,
+    authenticatorData []byte) (*Authenticator, error) {
+
+    auth, _ := parseAuthenticator(authenticatorData)
+    exportedKey, _ := conn.ConnectionState().ExportKeyingMaterial(...)
+    verifyCertificateVerify(auth.Certificate, handshakeContext, exportedKey, auth.CertificateVerify)
+    return auth
+}
+```
+
+**What this does:**
+- Implements RFC 9261 post-handshake authentication for TLS 1.3
+- Uses `ExportKeyingMaterial()` to derive session-specific secrets
+- Cryptographically binds authenticator to specific TLS connection
+- Prevents replay attacks across different sessions
+- Supports ECDSA P-256/384/521 and RSA-PSS signatures
+- Complete TLS wire format encoding/decoding
+
+### 7. Entity Attestation Token (EAT) and X.509 Extensions
+
+**File:** `pkg/tls/attestation_extension.go` (390 lines)
+
+```go
+// EAT structure (CBOR-encoded)
+type EAT struct {
+    Nonce              []byte            `cbor:"10,keyasint"`   // Fresh nonce
+    UEID               []byte            `cbor:"256,keyasint"`  // Chip ID
+    SecurityLevel      int               `cbor:"261,keyasint"`  // Hardware TEE = 3
+    AttestationReport  []byte            `cbor:"1001,keyasint"` // Raw 1184-byte report
+    Measurements       map[string][]byte `cbor:"1002,keyasint"` // SHA-384 measurements
+    TCBVersion         string            `cbor:"1003,keyasint"` // TCB version
+    CertificateChain   [][]byte          `cbor:"1100,keyasint"` // VCEK, ASK, ARK
+}
+
+// Create certificate with attestation extension
+func CreateCertificateWithAttestation(evidence *AttestationEvidence,
+    publicKey crypto.PublicKey, privateKey crypto.PrivateKey,
+    subject pkix.Name) (*x509.Certificate, error) {
+
+    // Encode attestation as CBOR EAT
+    eat := &EAT{
+        Nonce: evidence.Nonce,
+        UEID: evidence.Report.ChipID[:],
+        SecurityLevel: 3,
+        AttestationReport: evidence.Report.Marshal(),
+        Measurements: map[string][]byte{"measurement": evidence.Report.Measurement[:]},
+        TCBVersion: evidence.Report.GetTCBVersion(),
+        CertificateChain: evidence.Certificates,
+    }
+    eatBytes, _ := cbor.Marshal(eat)
+
+    // Create certificate with attestation extension (OID 1.3.6.1.4.1.99999.1)
+    template := &x509.Certificate{
+        ExtraExtensions: []pkix.Extension{{
+            Id: OIDAttestationExtension,
+            Critical: false,
+            Value: eatBytes,
+        }},
+    }
+
+    certDER, _ := x509.CreateCertificate(rand.Reader, template, template, publicKey, privateKey)
+    return x509.ParseCertificate(certDER)
+}
+
+// Extract attestation from certificate
+func ExtractAttestationExtension(cert *x509.Certificate) (*AttestationEvidence, error) {
+    // Find attestation extension
+    var eatBytes []byte
+    for _, ext := range cert.Extensions {
+        if ext.Id.Equal(OIDAttestationExtension) {
+            eatBytes = ext.Value
+            break
+        }
+    }
+
+    // CBOR-decode EAT
+    var eat EAT
+    cbor.Unmarshal(eatBytes, &eat)
+
+    // Parse attestation report
+    report, _ := attestation.ParseReport(eat.AttestationReport)
+
+    // Return reconstructed evidence
+    return &AttestationEvidence{
+        Report: report,
+        Certificates: eat.CertificateChain,
+        Nonce: eat.Nonce,
+        Timestamp: eat.Timestamp,
+    }
+}
+```
+
+**What this does:**
+- Encodes attestation evidence as CBOR EAT (Entity Attestation Token)
+- Embeds EAT in X.509 certificate extension (custom OID)
+- Includes all SEV-SNP attestation data (report, measurements, TCB, certificates)
+- Extracts and validates attestation from peer certificates
+- Validates timestamp freshness (±5 minutes)
+- Enforces security level (hardware TEE minimum)
+- Creates self-signed certificates with 1-day validity
+- Supports Certificate Signing Requests (CSRs) with attestation
+
 ---
 
 ## ❌ NOT YET IMPLEMENTED
 
-### Phase 2.2: TLS Exported Authenticators (RFC 9261)
-
-**Missing File:** `pkg/tls/exported_auth.go`
-
-**What should happen:**
-1. Client and proxy establish TLS 1.3 connection
-2. After handshake, proxy generates "Exported Authenticator":
-   ```go
-   // MISSING CODE:
-   func GenerateAuthenticator(conn *tls.Conn, attestation *AttestationEvidence) ([]byte, error) {
-       // 1. Export session keys using conn.ConnectionState().ExportKeyingMaterial()
-       // 2. Create Certificate message containing attestation
-       // 3. Sign with session-derived keys
-       // 4. Return authenticator bytes
-   }
-   ```
-3. Client verifies the authenticator proves:
-   - The attestation is bound to THIS TLS session
-   - Cannot be replayed on different connection
-
-**Why this matters:** Without this, attestation isn't cryptographically bound to the TLS session.
-
-### Phase 2.3: Attestation in Certificate Extension
-
-**Missing File:** `pkg/tls/attestation_extension.go`
-
-**What should happen:**
-```go
-// MISSING CODE:
-func CreateCertificateWithAttestation(evidence *AttestationEvidence) (*x509.Certificate, error) {
-    // 1. Encode evidence as EAT (Entity Attestation Token) in CBOR
-    // 2. Create X.509 certificate with custom extension OID
-    // 3. Embed EAT in extension
-    // 4. Return certificate for use in TLS handshake
-}
-```
-
-### Phase 2.4: Policy Verification
+### Phase 2.4: Policy Verification Engine
 
 **Missing File:** `pkg/policy/verifier.go`
 
@@ -355,31 +453,45 @@ fmt.Printf("Mock measurement: %s\n", evidence.Report.Measurement)
 
 ## Summary
 
-### ✅ Implemented (Phase 2.1):
-- SEV-SNP attestation report structures
-- CGo bindings to `/dev/sev-guest`
-- Hardware attestation report generation
-- AMD certificate chain fetching
-- Mock attester for testing
+### ✅ Implemented (Phases 2.1, 2.2, 2.3):
+- **Phase 2.1: SEV-SNP Attestation**
+  - SEV-SNP attestation report structures (1184 bytes)
+  - CGo bindings to `/dev/sev-guest` ioctl
+  - Hardware attestation report generation
+  - AMD certificate chain fetching (VCEK, ASK, ARK)
+  - Mock attester for testing without hardware
+
+- **Phase 2.2: RFC 9261 Exported Authenticators**
+  - Complete RFC 9261 implementation (574 lines)
+  - Session-specific key derivation via ExportKeyingMaterial()
+  - Cryptographic binding of attestation to TLS session
+  - Support for ECDSA P-256/384/521 and RSA-PSS
+  - TLS wire format encoding/decoding
+
+- **Phase 2.3: EAT and X.509 Extensions**
+  - Entity Attestation Token (EAT) CBOR encoding (390 lines)
+  - X.509 certificate extension embedding (custom OID)
+  - Complete SEV-SNP attestation data inclusion
+  - Timestamp freshness validation
+  - Security level enforcement
+  - CSR support with attestation
 
 ### ❌ Still Needed:
-- RFC 9261 Exported Authenticators (Phase 2.2)
-- EAT encoding in X.509 extensions (Phase 2.3)
-- Policy verification engine (Phase 2.4)
-- Integration into proxy handler (Phase 3)
-- OAuth Token Exchange (Phase 3)
+- **Phase 2.4:** Policy verification engine
+- **Phase 3:** Integration into proxy handler
+- **Phase 3:** OAuth Token Exchange (STS)
 
 ### Key Files:
-- `pkg/attestation/types.go` - Report structures ✅
-- `pkg/attestation/sev_snp.go` - Hardware interface ✅
-- `pkg/tls/exported_auth.go` - RFC 9261 (missing)
-- `pkg/tls/attestation_extension.go` - EAT extension (missing)
-- `pkg/policy/verifier.go` - Verification logic (missing)
-- `pkg/backend/proxy.go` - Needs attestation integration (missing)
+- `pkg/attestation/types.go` (367 lines) - Report structures ✅
+- `pkg/attestation/sev_snp.go` (302 lines) - Hardware interface ✅
+- `pkg/tls/exported_auth.go` (574 lines) - RFC 9261 ✅
+- `pkg/tls/attestation_extension.go` (390 lines) - EAT extension ✅
+- `pkg/policy/verifier.go` - Verification logic ❌
+- `pkg/backend/proxy.go` - Needs attestation integration ❌
 
 ### Next Steps:
-1. Implement `pkg/tls/exported_auth.go` (RFC 9261)
-2. Implement `pkg/policy/verifier.go` (measurement verification)
-3. Update `pkg/backend/proxy.go` to verify attestation before forwarding
+1. Implement `pkg/policy/verifier.go` (AMD signature chain verification, measurement comparison)
+2. Update `pkg/backend/proxy.go` to extract and verify attestation before forwarding
+3. Implement OAuth Token Exchange (Phase 3)
 
-The foundation is in place - we can now GET attestation reports from hardware. We need to VERIFY them and BIND them to TLS sessions.
+**Current State:** We can now GET attestation from hardware, ENCODE it in certificates, and BIND it to TLS sessions. We still need to VERIFY attestation and INTEGRATE into the proxy handler.
