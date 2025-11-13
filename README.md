@@ -30,10 +30,14 @@ A Trusted Execution Environment (TEE)-based proxy that enhances TLS 1.3 with har
 
 # Opens dashboard at: http://localhost:9090
 # - 3 CockroachDB nodes
-# - 3 Attested TLS proxies with nonce validation
-# - Real-time attestation dashboard
-# - 10 test clients (5 DENIED, 5 ALLOWED)
-# - Demonstrates successful nonce validation
+# - 3 Attested TLS proxies with server-side nonce validation
+# - Real-time attestation dashboard with denial reason analytics
+# - Multiple test clients demonstrating:
+#   ✓ Valid attestations with proper nonce (ALLOWED)
+#   ✗ Invalid nonce/expired/missing (DENIED - nonce_validation)
+#   ✗ Low TCB version (DENIED - tcb_version)
+#   ✗ Debug mode enabled (DENIED - debug_mode)
+#   ✗ SMT enabled (DENIED - smt)
 ```
 
 **Environment Detection:**
@@ -43,9 +47,15 @@ A Trusted Execution Environment (TEE)-based proxy that enhances TLS 1.3 with har
 - No manual configuration required
 
 The dashboard shows:
-- ✅ **Real-time metrics** - Total clients, active connections, proxy nodes
-- ✅ **Attestation analytics** - Measurement distribution (bar chart), proxy distribution (pie chart)
-- ✅ **Audit records** - Full attestation history with pagination
+- ✅ **Real-time metrics** - Total clients, active connections, proxy nodes, denied clients
+- ✅ **Denial analytics** - Bar chart showing denial reasons by type with distinct colors
+  - nonce_validation (most common - missing/expired nonce)
+  - tcb_version (firmware too old)
+  - debug_mode (debug enabled - security risk)
+  - smt (SMT enabled - side-channel risk)
+  - guest_policy (multiple policy violations)
+- ✅ **Proxy distribution** - Pie chart showing clients across proxy nodes
+- ✅ **Audit records** - Full attestation history with pagination and hover tooltips
 - ✅ **Auto-refresh** - Live data updates every 5 seconds
 
 ---
@@ -106,8 +116,12 @@ Traditional TLS proves *identity* via certificates. **Attested TLS (aTLS)** adds
 
 ✅ **Hardware-Rooted Attestation** - AMD SEV-SNP generates cryptographic proof of running code
 ✅ **X.509 Certificate Extension** - Attestation embedded per RFC 9261 Exported Authenticators
+✅ **Nonce-Based Validation** - Server-issued challenge-response protocol prevents replay attacks
+  - Clients MUST request fresh nonce before each connection
+  - 5-minute TTL, one-time use, cryptographically secure
+  - Most common denial reason: missing/expired nonce
 ✅ **Policy Enforcement** - Configurable measurement verification and access control
-✅ **Server-Side Nonce Validation** - Challenge-response protocol prevents replay attacks
+✅ **Real-Time Dashboard** - Monitor attestations, denial reasons, and policy violations
 ✅ **Zero Backend Changes** - Transparent proxy - CockroachDB requires no modifications
 ✅ **Production-Ready Testing** - Comprehensive integration and E2E test framework
 
@@ -147,7 +161,7 @@ Traditional TLS proves *identity* via certificates. **Attested TLS (aTLS)** adds
 - No external network exposure for CockroachDB
 - Single attestation covers both components
 
-### Connection Flow
+### Connection Flow with Nonce-Based Attestation
 
 ```mermaid
 sequenceDiagram
@@ -156,42 +170,76 @@ sequenceDiagram
     participant Proxy (TEE)
     participant CockroachDB
 
+    Note over Client: Step 1: Request Fresh Nonce
     Client->>Proxy API: GET /api/v1/nonce
+    Proxy API->>Proxy API: Generate 32-byte nonce<br/>Store with 5-min TTL
     Proxy API->>Client: { nonce: "9ba6ee...", expires_in: 300 }
-    Note over Proxy API: Nonce stored with 5-min TTL<br/>One-time use
+    Note over Client,Proxy API: Nonce prevents replay attacks<br/>One-time use only
 
-    Client->>Proxy (TEE): TLS ClientHello
-    Proxy (TEE)->>Client: ServerHello + Certificate (with Attestation Extension)
-    Note over Client,Proxy (TEE): Certificate contains:<br/>- AMD SEV-SNP Report (1184 bytes)<br/>- Measurement (SHA-384 hash)<br/>- Policy bits (debug, SMT)<br/>- TCB version<br/>- Nonce (from proxy API)<br/>- Signature (ECDSA P-384)
+    Note over Client: Step 2: Generate Attestation
+    Client->>Client: Call SEV-SNP /dev/sev-guest<br/>with nonce as report_data
+    Note over Client: Attestation includes:<br/>- Nonce from Step 1<br/>- Measurement hash<br/>- TCB version<br/>- Policy bits
 
-    Proxy (TEE)->>Proxy (TEE): Verify Attestation:<br/>1. Validate nonce from server store<br/>2. Check measurement matches policy<br/>3. Verify TCB version >= minimum<br/>4. Ensure debug disabled<br/>5. Check ECDSA signature<br/>6. Consume nonce (one-time use)
+    Note over Client: Step 3: TLS Handshake with Attestation
+    Client->>Proxy (TEE): TLS ClientHello + Certificate<br/>(with Attestation Extension)
+    Note over Proxy (TEE): Certificate embeds:<br/>- AMD SEV-SNP Report (1184 bytes)<br/>- Measurement (SHA-384 hash)<br/>- Policy bits (debug, SMT)<br/>- TCB version<br/>- Nonce (must match server)<br/>- Signature (ECDSA P-384)
 
-    alt Attestation Valid
-        Proxy (TEE)->>CockroachDB: Forward connection
-        CockroachDB->>Proxy (TEE): Response
+    Note over Proxy (TEE): Step 4: Verify Attestation
+    Proxy (TEE)->>Proxy (TEE): 1. Validate nonce exists in store<br/>2. Check nonce not expired<br/>3. Verify measurement matches policy<br/>4. Verify TCB version >= minimum<br/>5. Check debug disabled<br/>6. Check SMT disabled<br/>7. Verify ECDSA signature<br/>8. Consume nonce (prevent reuse)
+
+    alt Attestation Valid ✓
+        Proxy (TEE)->>Proxy (TEE): Store attestation record<br/>(ALLOWED)
+        Proxy (TEE)->>CockroachDB: Forward SQL connection
+        CockroachDB->>Proxy (TEE): SQL Response
         Proxy (TEE)->>Client: Response
-    else Attestation Invalid
-        Proxy (TEE)--xClient: TLS Alert: Attestation verification failed
-        Note over Client: Connection rejected during handshake
+        Note over Client,CockroachDB: Secure connection established
+    else Attestation Invalid ✗
+        Proxy (TEE)->>Proxy (TEE): Store attestation record<br/>(DENIED + reason)
+        Proxy (TEE)--xClient: TLS Alert: Verification failed
+        Note over Client: Connection rejected<br/>Reason logged in dashboard
     end
 ```
 
 **Attestation Flow:**
 
 1. **Nonce Request** - Client requests fresh nonce from proxy API (`GET /api/v1/nonce`)
-2. **Handshake** - Client initiates TLS 1.3 connection to proxy with nonce
-3. **Attestation Presentation** - Client embeds SEV-SNP attestation in X.509 certificate extension
-4. **Verification** - Proxy verifies during TLS handshake:
-   - ✅ Nonce recognized by server (prevents replay attacks)
-   - ✅ Measurement matches expected hash
-   - ✅ TCB version meets minimum
-   - ✅ Debug mode disabled
-   - ✅ SMT disabled (if required)
-   - ✅ Signature valid (ECDSA P-384 from AMD chip)
-5. **Nonce Consumption** - Nonce is consumed (one-time use)
-6. **Decision** - ALLOW or DENY based on policy
+   - Proxy generates cryptographically secure 32-byte nonce
+   - Nonce stored in server with 5-minute TTL
+   - Returns nonce hex string and expiration time to client
+
+2. **Attestation Generation** - Client generates SEV-SNP attestation with nonce
+   - Client calls `/dev/sev-guest` ioctl with nonce as `report_data`
+   - AMD firmware creates 1184-byte attestation report
+   - Report includes nonce, measurement, TCB version, policy bits
+   - Signed by AMD chip (ECDSA P-384)
+
+3. **TLS Handshake** - Client connects with attestation embedded in certificate
+   - Client creates X.509 certificate with attestation extension (RFC 9261)
+   - Initiates TLS 1.3 connection to proxy
+   - Certificate presented during ClientHello
+
+4. **Verification** - Proxy verifies attestation during TLS handshake:
+   - ✅ **Nonce validation** - Must exist in server store, not expired, one-time use
+   - ✅ **Measurement** - SHA-384 hash matches expected value
+   - ✅ **TCB version** - Firmware version meets minimum requirement
+   - ✅ **Guest policy** - Debug mode disabled, SMT disabled
+   - ✅ **Signature** - ECDSA P-384 signature from AMD chip valid
+
+5. **Nonce Consumption** - Nonce deleted from store (prevents reuse)
+
+6. **Decision** - ALLOW or DENY based on verification result
+   - All attestations stored in database with verdict and reason
+   - ALLOWED connections proceed to Step 7
+   - DENIED connections receive TLS alert and disconnect
+
 7. **Forwarding** - Only verified connections forwarded to CockroachDB
-8. **Audit** - All decisions logged for compliance
+   - Proxy establishes backend connection
+   - Bidirectional data forwarding begins
+
+8. **Audit** - All decisions logged in dashboard for compliance
+   - View denial reasons by type (nonce_validation, tcb_version, debug_mode, smt)
+   - Track attestations by proxy node
+   - Inspect individual attestation records with full details
 
 ---
 
@@ -460,12 +508,20 @@ The `run-cluster-demo.sh` script sets up a complete attested TLS infrastructure 
 - **Total Clients** - All attestation records across all proxies
 - **Active Connections** - Currently connected clients
 - **Proxy Nodes** - Number of healthy proxy instances
-- **Unique Measurements** - Distinct client configurations
+- **Denied Clients** - Total number of rejected attestations
 
 **Visual Analytics:**
-- **Bar Chart** - Client distribution by measurement hash
-- **Pie Chart** - Client distribution by proxy node
-- **Table View** - Complete attestation audit log with pagination
+- **Denial Reasons Chart** - Bar chart showing denial reasons (nonce_validation, tcb_version, debug_mode, smt, guest_policy)
+  - Each failure type has distinct color for easy identification
+  - Hover over bars to see detailed failure counts
+- **Clients by Proxy Node** - Pie chart showing client distribution across proxy nodes
+  - Professional color palette (indigo, violet, pink, cyan, amber)
+  - Interactive tooltips with proxy details
+- **Attestation Records Table** - Complete audit log with:
+  - Attestation ID, Measurement hash, Family ID, Image ID, Chip ID
+  - TCB version, Debug/SMT flags, Connection timestamps
+  - Verification status with hover tooltips for denial reasons
+  - Pagination support (5 records per page)
 
 **Auto-Refresh:** Data updates every 5 seconds automatically
 
@@ -501,7 +557,10 @@ The `run-cluster-demo.sh` script sets up a complete attested TLS infrastructure 
 
 Each proxy exposes a REST API for querying attestation data:
 
-**Nonce Generation (NEW - Phase 2.5):**
+**⚠️ REQUIRED FIRST STEP: Nonce Generation**
+
+Before connecting, clients MUST request a fresh nonce:
+
 ```bash
 curl http://localhost:8081/api/v1/nonce
 ```
@@ -513,18 +572,25 @@ curl http://localhost:8081/api/v1/nonce
 }
 ```
 
-**What this does:**
-- Generates cryptographically secure 32-byte nonce
-- Nonce valid for 5 minutes (expires_in: 300 seconds)
-- One-time use - consumed after attestation verification
-- Prevents replay attacks and ensures attestation freshness
+**Nonce-Based Attestation Architecture:**
+- **Cryptographically Secure** - 32-byte random nonce (256 bits of entropy)
+- **Time-Limited** - Valid for 5 minutes (expires_in: 300 seconds)
+- **One-Time Use** - Consumed after attestation verification
+- **Replay Prevention** - Old attestations cannot be reused
+- **Freshness Guarantee** - Proves attestation was generated recently
 
-**Client Flow:**
-1. Client requests nonce from proxy API: `GET /api/v1/nonce`
-2. Proxy generates and stores nonce with TTL
-3. Client includes nonce in attestation evidence
-4. Proxy validates nonce during TLS handshake
-5. Nonce is consumed (cannot be reused)
+**Required Client Flow:**
+1. **Request Nonce** - `GET /api/v1/nonce` → Returns hex-encoded nonce
+2. **Generate Attestation** - Call SEV-SNP `/dev/sev-guest` with nonce as `report_data`
+3. **Connect with TLS** - Present attestation in X.509 certificate extension
+4. **Proxy Validates** - Checks nonce exists in server store, not expired
+5. **Nonce Consumed** - Deleted from store, cannot be reused
+
+**Why Nonce Validation Matters:**
+- Prevents attackers from replaying old valid attestations
+- Ensures attestation was generated for this specific connection attempt
+- Most common denial reason in dashboard is `nonce_validation` (clients forgetting this step)
+- Without valid nonce, connection will be rejected during TLS handshake
 
 **Statistics Overview:**
 ```bash
