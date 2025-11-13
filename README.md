@@ -21,7 +21,7 @@ A Trusted Execution Environment (TEE)-based proxy that enhances TLS 1.3 with har
 
 ### 🎬 Live Demo - Attestation Dashboard
 
-![Dashboard Demo](dashboard-demo.gif)
+<img src="dashboard-demo.gif" width="100%" alt="Dashboard Demo" />
 
 **Try it yourself in 30 seconds:**
 ```bash
@@ -502,7 +502,7 @@ The `run-cluster-demo.sh` script sets up a complete attested TLS infrastructure 
 
 **Real-time Monitoring:** http://localhost:9090
 
-![Dashboard Demo](dashboard-demo.gif)
+<img src="dashboard-demo.gif" width="100%" alt="Dashboard Demo" />
 
 **Metrics Cards:**
 - **Total Clients** - All attestation records across all proxies
