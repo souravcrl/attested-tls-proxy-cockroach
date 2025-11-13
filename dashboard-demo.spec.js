@@ -1,8 +1,8 @@
 const { test, expect } = require('@playwright/test');
 
 test('Dashboard Demo Recording', async ({ page }) => {
-  // Set viewport size
-  await page.setViewportSize({ width: 1280, height: 900 });
+  // Set viewport size optimized for GitHub README display
+  await page.setViewportSize({ width: 1000, height: 800 });
 
   console.log('🌐 Navigating to dashboard...');
   await page.goto('http://localhost:8081');
