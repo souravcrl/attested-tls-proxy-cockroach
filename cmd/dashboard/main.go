@@ -186,10 +186,11 @@ func (d *Dashboard) refreshData() {
 			activeCount := 0
 			if result.Attestations != nil {
 				for _, client := range result.Attestations {
-					if client != nil && !client.DisconnectedAt.IsZero() {
-						// DisconnectedAt is NOT zero means it's disconnected
-						// We want to count connections where DisconnectedAt IS zero (not yet disconnected)
-					} else if client != nil {
+					if client == nil {
+						continue
+					}
+					// DisconnectedAt is nil or zero means still connected
+					if client.DisconnectedAt == nil || client.DisconnectedAt.IsZero() {
 						activeCount++
 					}
 				}

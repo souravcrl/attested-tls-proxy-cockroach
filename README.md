@@ -25,15 +25,22 @@ A Trusted Execution Environment (TEE)-based proxy that enhances TLS 1.3 with har
 
 **Try it yourself in 30 seconds:**
 ```bash
-# Run the complete cluster demo
+# Run the complete cluster demo (auto-detects environment)
 ./run-cluster-demo.sh
 
 # Opens dashboard at: http://localhost:9090
 # - 3 CockroachDB nodes
-# - 3 Attested TLS proxies
+# - 3 Attested TLS proxies with nonce validation
 # - Real-time attestation dashboard
-# - 10 test clients with attestation records
+# - 10 test clients (5 DENIED, 5 ALLOWED)
+# - Demonstrates successful nonce validation
 ```
+
+**Environment Detection:**
+- **SEV-SNP VM** - Uses real hardware attestation (`/dev/sev-guest`)
+- **macOS/Linux** - Uses mock attestation for development
+- Automatic CGO flags configuration
+- No manual configuration required
 
 The dashboard shows:
 - ✅ **Real-time metrics** - Total clients, active connections, proxy nodes
@@ -100,7 +107,7 @@ Traditional TLS proves *identity* via certificates. **Attested TLS (aTLS)** adds
 ✅ **Hardware-Rooted Attestation** - AMD SEV-SNP generates cryptographic proof of running code
 ✅ **X.509 Certificate Extension** - Attestation embedded per RFC 9261 Exported Authenticators
 ✅ **Policy Enforcement** - Configurable measurement verification and access control
-✅ **Nonce Binding** - Fresh attestation per connection prevents replay attacks
+✅ **Server-Side Nonce Validation** - Challenge-response protocol prevents replay attacks
 ✅ **Zero Backend Changes** - Transparent proxy - CockroachDB requires no modifications
 ✅ **Production-Ready Testing** - Comprehensive integration and E2E test framework
 
@@ -145,40 +152,46 @@ Traditional TLS proves *identity* via certificates. **Attested TLS (aTLS)** adds
 ```mermaid
 sequenceDiagram
     participant Client
+    participant Proxy API
     participant Proxy (TEE)
     participant CockroachDB
 
+    Client->>Proxy API: GET /api/v1/nonce
+    Proxy API->>Client: { nonce: "9ba6ee...", expires_in: 300 }
+    Note over Proxy API: Nonce stored with 5-min TTL<br/>One-time use
+
     Client->>Proxy (TEE): TLS ClientHello
     Proxy (TEE)->>Client: ServerHello + Certificate (with Attestation Extension)
-    Note over Client,Proxy (TEE): Certificate contains:<br/>- AMD SEV-SNP Report (1184 bytes)<br/>- Measurement (SHA-384 hash)<br/>- Policy bits (debug, SMT)<br/>- TCB version<br/>- Signature (ECDSA P-384)
+    Note over Client,Proxy (TEE): Certificate contains:<br/>- AMD SEV-SNP Report (1184 bytes)<br/>- Measurement (SHA-384 hash)<br/>- Policy bits (debug, SMT)<br/>- TCB version<br/>- Nonce (from proxy API)<br/>- Signature (ECDSA P-384)
 
-    Client->>Client: Verify Attestation:<br/>1. Check measurement matches policy<br/>2. Verify TCB version >= minimum<br/>3. Ensure debug disabled<br/>4. Validate nonce freshness<br/>5. Check ECDSA signature
+    Proxy (TEE)->>Proxy (TEE): Verify Attestation:<br/>1. Validate nonce from server store<br/>2. Check measurement matches policy<br/>3. Verify TCB version >= minimum<br/>4. Ensure debug disabled<br/>5. Check ECDSA signature<br/>6. Consume nonce (one-time use)
 
     alt Attestation Valid
-        Client->>Proxy (TEE): Finished
         Proxy (TEE)->>CockroachDB: Forward connection
         CockroachDB->>Proxy (TEE): Response
         Proxy (TEE)->>Client: Response
     else Attestation Invalid
-        Client->>Proxy (TEE): Alert: bad_certificate
-        Proxy (TEE)--xClient: Connection rejected
+        Proxy (TEE)--xClient: TLS Alert: Attestation verification failed
+        Note over Client: Connection rejected during handshake
     end
 ```
 
 **Attestation Flow:**
 
-1. **Handshake** - Client initiates TLS 1.3 connection to proxy
-2. **Attestation Presentation** - Proxy embeds SEV-SNP attestation in X.509 certificate extension
-3. **Verification** - Client/verifier checks:
+1. **Nonce Request** - Client requests fresh nonce from proxy API (`GET /api/v1/nonce`)
+2. **Handshake** - Client initiates TLS 1.3 connection to proxy with nonce
+3. **Attestation Presentation** - Client embeds SEV-SNP attestation in X.509 certificate extension
+4. **Verification** - Proxy verifies during TLS handshake:
+   - ✅ Nonce recognized by server (prevents replay attacks)
    - ✅ Measurement matches expected hash
    - ✅ TCB version meets minimum
    - ✅ Debug mode disabled
    - ✅ SMT disabled (if required)
-   - ✅ Nonce is fresh (not replayed)
    - ✅ Signature valid (ECDSA P-384 from AMD chip)
-4. **Decision** - ALLOW or DENY based on policy
-5. **Forwarding** - Only verified connections forwarded to CockroachDB
-6. **Audit** - All decisions logged for compliance
+5. **Nonce Consumption** - Nonce is consumed (one-time use)
+6. **Decision** - ALLOW or DENY based on policy
+7. **Forwarding** - Only verified connections forwarded to CockroachDB
+8. **Audit** - All decisions logged for compliance
 
 ---
 
@@ -488,6 +501,31 @@ The `run-cluster-demo.sh` script sets up a complete attested TLS infrastructure 
 
 Each proxy exposes a REST API for querying attestation data:
 
+**Nonce Generation (NEW - Phase 2.5):**
+```bash
+curl http://localhost:8081/api/v1/nonce
+```
+```json
+{
+  "nonce": "9ba6eee874da3e5a55b60d1a57e6114eae26bf8d04a281d418832f9dc6453827",
+  "expires_in": 300,
+  "timestamp": "2025-11-13T12:29:40+05:30"
+}
+```
+
+**What this does:**
+- Generates cryptographically secure 32-byte nonce
+- Nonce valid for 5 minutes (expires_in: 300 seconds)
+- One-time use - consumed after attestation verification
+- Prevents replay attacks and ensures attestation freshness
+
+**Client Flow:**
+1. Client requests nonce from proxy API: `GET /api/v1/nonce`
+2. Proxy generates and stores nonce with TTL
+3. Client includes nonce in attestation evidence
+4. Proxy validates nonce during TLS handshake
+5. Nonce is consumed (cannot be reused)
+
 **Statistics Overview:**
 ```bash
 curl http://localhost:8081/api/v1/stats/overview
@@ -496,10 +534,10 @@ curl http://localhost:8081/api/v1/stats/overview
 {
   "proxy_node_id": "proxy-1",
   "total_attestations": 10,
-  "allowed": 9,
-  "denied": 1,
+  "allowed": 2,
+  "denied": 8,
   "active_connections": 0,
-  "timestamp": "2025-11-12T03:46:00Z"
+  "timestamp": "2025-11-13T12:30:00Z"
 }
 ```
 

@@ -2,6 +2,7 @@
 
 # Cluster Demo Script
 # Starts 3 CockroachDB nodes, 3 proxies, dashboard, and test clients
+# Shows both DENIED (self-generated nonce) and ALLOWED (proxy-provided nonce) clients
 
 set -e
 
@@ -28,6 +29,7 @@ cleanup() {
         echo "  Stopping dashboard (PID: $DASHBOARD_PID)..."
         kill $DASHBOARD_PID 2>/dev/null || true
     fi
+    pkill -f "cmd/dashboard" 2>/dev/null || true
 
     # Kill proxies
     for pid in "${PROXY_PIDS[@]}"; do
@@ -36,6 +38,8 @@ cleanup() {
             kill $pid 2>/dev/null || true
         fi
     done
+    pkill -f "attested-tls-proxy" 2>/dev/null || true
+    pkill -f "cmd/proxy" 2>/dev/null || true
 
     # Kill CockroachDB nodes gracefully
     for pid_file in cockroach-data/node*.pid; do
@@ -51,26 +55,53 @@ cleanup() {
 
     # Fallback: kill any remaining processes
     pkill -f "cockroach start" 2>/dev/null || true
-    pkill -f "attested-tls-proxy" 2>/dev/null || true
-    pkill -f "dashboard" 2>/dev/null || true
     pkill -f "connect_to_cluster" 2>/dev/null || true
+    pkill -f "test_nonce_clients" 2>/dev/null || true
 
-    # Clean up database files (optional - comment out to preserve data)
-    # rm -f /tmp/attestations-node*.db
-    # rm -f /tmp/atls-proxy-audit-node*.json
+    # Clean up old attestation databases
+    rm -f /tmp/attestations-node*.db
+    rm -f /tmp/atls-proxy-audit-node*.json
 
     sleep 2
     echo -e "${GREEN}Shutdown complete${NC}"
-    echo ""
-    echo "Note: Attestation databases preserved at /tmp/attestations-node*.db"
-    echo "To view data: sqlite3 /tmp/attestations-node1.db 'SELECT * FROM client_attestations;'"
 }
 
 # Trap signals for graceful shutdown
 trap cleanup EXIT INT TERM
 
 # Clean any existing processes
+echo -e "${YELLOW}Cleaning up any existing processes...${NC}"
 cleanup
+
+# Detect environment
+echo -e "${GREEN}Detecting environment...${NC}"
+if [ -e "/dev/sev-guest" ]; then
+    echo "  ✓ SEV-SNP device detected - using real hardware attestation"
+    ATTESTATION_MODE="sev-snp"
+    export CGO_CFLAGS="-I/usr/include"
+    export CGO_LDFLAGS="-L/usr/lib/x86_64-linux-gnu -lcrypto"
+elif [ "$(uname)" == "Darwin" ]; then
+    echo "  ℹ Running on macOS - using mock attestation"
+    ATTESTATION_MODE="mock"
+    export CGO_CFLAGS="-I/opt/homebrew/opt/openssl@3/include"
+    export CGO_LDFLAGS="-L/opt/homebrew/opt/openssl@3/lib -lcrypto"
+else
+    echo "  ℹ Running on Linux (no SEV-SNP) - using mock attestation"
+    ATTESTATION_MODE="mock"
+    export CGO_CFLAGS="-I/usr/include"
+    export CGO_LDFLAGS="-L/usr/lib/x86_64-linux-gnu -lcrypto"
+fi
+
+# Build binaries
+echo -e "${GREEN}Building binaries...${NC}"
+echo "  Building proxy..."
+go build -o attested-tls-proxy ./cmd/proxy || { echo "Failed to build proxy"; exit 1; }
+
+echo "  Building dashboard..."
+go build -o dashboard ./cmd/dashboard || { echo "Failed to build dashboard"; exit 1; }
+
+echo -e "${GREEN}✓ Binaries built successfully${NC}"
+echo -e "${YELLOW}Attestation mode: $ATTESTATION_MODE${NC}\n"
 
 # Create data directories
 mkdir -p cockroach-data/node1
@@ -119,8 +150,6 @@ echo -e "${GREEN}Step 4: Initializing cluster${NC}"
 sleep 2
 
 echo -e "${GREEN}Step 5: Starting Proxy Node 1 (port 26257 -> CRDB 26258)${NC}"
-export CGO_CFLAGS="-I/opt/homebrew/Cellar/openssl@3/3.5.0/include"
-export CGO_LDFLAGS="-L/opt/homebrew/Cellar/openssl@3/3.5.0/lib -lcrypto"
 ./attested-tls-proxy -config config/proxy-node1.yaml > /tmp/proxy1.log 2>&1 &
 PROXY1_PID=$!
 PROXY_PIDS+=($PROXY1_PID)
@@ -171,22 +200,25 @@ sleep 5
 
 # Check if services are responding
 echo -e "${GREEN}Step 9: Verifying services...${NC}"
-curl -s http://localhost:8081/api/v1/health > /dev/null && echo "  ✓ Proxy 1 API responding"
-curl -s http://localhost:8082/api/v1/health > /dev/null && echo "  ✓ Proxy 2 API responding"
-curl -s http://localhost:8083/api/v1/health > /dev/null && echo "  ✓ Proxy 3 API responding"
-curl -s http://localhost:9090 > /dev/null && echo "  ✓ Dashboard responding"
+curl -s http://localhost:8081/api/v1/health > /dev/null && echo "  ✓ Proxy 1 API responding" || echo "  ✗ Proxy 1 API not responding"
+curl -s http://localhost:8082/api/v1/health > /dev/null && echo "  ✓ Proxy 2 API responding" || echo "  ✗ Proxy 2 API not responding"
+curl -s http://localhost:8083/api/v1/health > /dev/null && echo "  ✓ Proxy 3 API responding" || echo "  ✗ Proxy 3 API not responding"
+curl -s http://localhost:9090 > /dev/null && echo "  ✓ Dashboard responding" || echo "  ✗ Dashboard not responding"
+echo "  ✓ Nonce endpoint available at: http://localhost:8081/api/v1/nonce"
 
 echo ""
-echo -e "${GREEN}Step 10: Running 10 attested TLS test clients...${NC}"
-echo "This will create attestation records with proper TLS handshake"
+echo -e "${GREEN}Step 10: Running test clients (showing both DENIED and ALLOWED)...${NC}"
+echo "This will create:"
+echo "  - 5 clients with self-generated nonces (will be DENIED)"
+echo "  - 5 clients fetching nonces from proxy (will be ALLOWED)"
 echo ""
 
-# Create test client program if it doesn't exist
-if [ ! -f connect_to_cluster.go ]; then
-    cat > connect_to_cluster.go <<'CLIENTEOF'
+# Create test client program
+cat > test_nonce_clients.go <<'CLIENTEOF'
 package main
 
 import (
+	"crypto/rand"
 	"fmt"
 	"log"
 	"time"
@@ -201,69 +233,111 @@ func main() {
 		"localhost:26277",
 	}
 
-	log.Println("Connecting 10 clients to cluster proxies with attestation...")
+	log.Println("Running test clients with nonce validation...")
+	log.Println("")
 
-	for i := 1; i <= 10; i++ {
+	// First 5 clients: Use self-generated nonces (WILL BE DENIED)
+	log.Println("=== Part 1: Clients with self-generated nonces (DENIED) ===")
+	for i := 1; i <= 5; i++ {
 		proxy := proxies[(i-1)%3]
-		log.Printf("\n=== Client %d connecting to %s ===", i, proxy)
+		log.Printf("\n--- Client %d (SELF-NONCE) connecting to %s ---", i, proxy)
 
 		client, err := testclient.NewTestClient()
 		if err != nil {
-			log.Printf("Error creating client: %v", err)
+			log.Printf("ERROR: Failed to create client: %v", err)
 			continue
 		}
 
-		evidence, err := testclient.DefaultValidEvidence()
+		// Generate our own nonce (not from proxy) - will fail validation
+		nonce := make([]byte, 32)
+		rand.Read(nonce)
+
+		params := testclient.AttestationParams{
+			DebugEnabled: false,
+			SMTEnabled:   false,
+			TCBVersion:   "1.51.0",
+			Nonce:        nonce,
+		}
+
+		evidence, err := testclient.CreateMockEvidence(params)
 		if err != nil {
-			log.Printf("Error creating evidence: %v", err)
+			log.Printf("ERROR: Failed to create evidence: %v", err)
 			client.Close()
 			continue
 		}
 
-		log.Printf("Generated attestation with measurement: %x...", evidence.Report.Measurement[:16])
-
 		err = client.GenerateCertificate(evidence)
 		if err != nil {
-			log.Printf("Error generating certificate: %v", err)
+			log.Printf("ERROR: Failed to generate certificate: %v", err)
 			client.Close()
 			continue
 		}
 
 		conn, err := client.Connect(proxy)
 		if err != nil {
-			log.Printf("Error connecting: %v", err)
+			log.Printf("ERROR: Connection failed (expected): %v", err)
 			client.Close()
 			continue
 		}
 
-		log.Printf("✓ Connected successfully!")
-
-		data := fmt.Sprintf("Test data from client %d\n", i)
+		log.Printf("✓ Connected (proxy accepted connection)")
+		data := fmt.Sprintf("Test data from client %d with self-nonce\n", i)
 		conn.Write([]byte(data))
-		log.Printf("✓ Sent test data")
 
-		time.Sleep(2 * time.Second)
-
+		time.Sleep(1 * time.Second)
 		conn.Close()
 		client.Close()
-		log.Printf("✓ Completed")
 
 		time.Sleep(500 * time.Millisecond)
 	}
 
-	log.Println("\n=== All clients completed! ===")
+	log.Println("")
+	log.Println("=== Part 2: Clients fetching nonces from proxy (ALLOWED) ===")
+
+	// Next 5 clients: Fetch nonces from proxy (WILL BE ALLOWED)
+	for i := 6; i <= 10; i++ {
+		proxy := proxies[(i-1)%3]
+		log.Printf("\n--- Client %d (PROXY-NONCE) connecting to %s ---", i, proxy)
+
+		client, err := testclient.NewTestClient()
+		if err != nil {
+			log.Printf("ERROR: Failed to create client: %v", err)
+			continue
+		}
+
+		// Use ConnectWithAttestation which fetches nonce from proxy
+		conn, err := client.ConnectWithAttestation(proxy)
+		if err != nil {
+			log.Printf("ERROR: Connection failed: %v", err)
+			client.Close()
+			continue
+		}
+
+		log.Printf("✓ Connected with valid proxy nonce!")
+		data := fmt.Sprintf("Test data from client %d with proxy nonce\n", i)
+		conn.Write([]byte(data))
+
+		time.Sleep(1 * time.Second)
+		conn.Close()
+		client.Close()
+
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	log.Println("")
+	log.Println("=== All test clients completed! ===")
+	log.Println("Check the dashboard to see DENIED and ALLOWED clients")
 }
 CLIENTEOF
-fi
 
 # Run test clients
-echo -e "  ${YELLOW}Starting 10 attested TLS clients...${NC}"
-go run connect_to_cluster.go > /tmp/clients.log 2>&1 &
+echo -e "  ${YELLOW}Starting test clients...${NC}"
+go run test_nonce_clients.go > /tmp/clients.log 2>&1 &
 CLIENT_PID=$!
 echo "Test clients PID: $CLIENT_PID"
 
 # Wait for clients to complete
-sleep 30
+sleep 25
 wait $CLIENT_PID 2>/dev/null || true
 echo -e "  ${GREEN}✓ Test clients completed${NC}"
 
@@ -284,12 +358,16 @@ if command -v curl &> /dev/null && command -v python3 &> /dev/null; then
 fi
 
 echo ""
-echo -e "${GREEN}Dashboard: ${YELLOW}http://localhost:9090${NC}"
+echo -e "${GREEN}View Results:${NC}"
+echo -e "  ${YELLOW}Dashboard: http://localhost:9090${NC}"
+echo "  You should see:"
+echo "    - DENIED clients (self-generated nonce)"
+echo "    - ALLOWED clients (proxy-provided nonce)"
 echo ""
 echo "API Endpoints:"
-echo "  - Proxy 1: http://localhost:8081/api/v1/stats/overview"
-echo "  - Proxy 2: http://localhost:8082/api/v1/stats/overview"
-echo "  - Proxy 3: http://localhost:8083/api/v1/stats/overview"
+echo "  - Nonce endpoint: http://localhost:8081/api/v1/nonce"
+echo "  - Attestations: http://localhost:8081/api/v1/attestations"
+echo "  - Stats: http://localhost:8081/api/v1/stats/overview"
 echo ""
 echo "CockroachDB Admin UIs:"
 echo "  - Node 1: http://localhost:8091"
@@ -311,7 +389,7 @@ echo ""
 echo -e "${YELLOW}Press Ctrl+C to gracefully stop all services${NC}"
 echo ""
 echo "To run more test clients:"
-echo "  go run connect_to_cluster.go"
+echo "  go run test_nonce_clients.go"
 echo ""
 
 # Keep script running and wait for signal
@@ -321,6 +399,7 @@ while true; do
     # Check if all services are still running
     if ! kill -0 $DASHBOARD_PID 2>/dev/null; then
         echo -e "\n${RED}Dashboard stopped unexpectedly!${NC}"
+        tail -20 /tmp/dashboard.log
         break
     fi
 
@@ -333,6 +412,10 @@ while true; do
 
     if [ $running_proxies -lt 3 ]; then
         echo -e "\n${RED}One or more proxies stopped unexpectedly!${NC}"
+        echo "Proxy logs:"
+        tail -10 /tmp/proxy1.log
+        tail -10 /tmp/proxy2.log
+        tail -10 /tmp/proxy3.log
         break
     fi
 done

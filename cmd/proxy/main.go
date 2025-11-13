@@ -46,6 +46,13 @@ func main() {
 	// Start HTTP API server if enabled
 	if cfg.Proxy.API.Enabled && proxy.GetAttestationStore() != nil {
 		apiServer := api.NewServer(proxy.GetAttestationStore(), cfg.Proxy.NodeID)
+
+		// Connect the API server's nonce validator to the proxy's verifier
+		if verifier := proxy.GetVerifier(); verifier != nil {
+			verifier.SetNonceValidator(apiServer)
+			logger.Log.Info().Msg("Nonce validation enabled - clients must fetch nonce from /api/v1/nonce")
+		}
+
 		go func() {
 			logger.Log.Info().
 				Str("address", cfg.Proxy.API.Listen).

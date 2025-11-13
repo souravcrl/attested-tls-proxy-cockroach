@@ -20,11 +20,17 @@ import (
 	"github.com/cockroachdb/attested-tls-proxy-cockroach/pkg/attestation"
 )
 
+// NonceValidator is an interface for validating nonces
+type NonceValidator interface {
+	ValidateNonce(nonce []byte) bool
+}
+
 // Verifier verifies attestation evidence against policy
 type Verifier struct {
-	policy *Policy
-	cache  *certCache
-	mu     sync.RWMutex
+	policy         *Policy
+	cache          *certCache
+	nonceValidator NonceValidator
+	mu             sync.RWMutex
 }
 
 // certCache caches parsed certificates
@@ -59,7 +65,15 @@ func NewVerifier(policy *Policy) (*Verifier, error) {
 		cache: &certCache{
 			vcek: make(map[string]*cachedCert),
 		},
+		nonceValidator: nil, // Can be set later with SetNonceValidator
 	}, nil
+}
+
+// SetNonceValidator sets the nonce validator for this verifier
+func (v *Verifier) SetNonceValidator(validator NonceValidator) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.nonceValidator = validator
 }
 
 // Verify verifies attestation evidence against the policy
@@ -165,6 +179,21 @@ func (v *Verifier) verifyNonce(evidence *attestation.AttestationEvidence, result
 		check.Passed = false
 		check.Message = "Nonce mismatch between evidence and report"
 		return check
+	}
+
+	// If a nonce validator is configured, validate against server-generated nonces
+	v.mu.RLock()
+	validator := v.nonceValidator
+	v.mu.RUnlock()
+
+	if validator != nil {
+		if !validator.ValidateNonce(evidence.Nonce) {
+			check.Passed = false
+			check.Message = "Nonce not recognized by server (must request nonce from /api/v1/nonce first)"
+			check.Details["hint"] = "Client should fetch nonce from proxy API before generating attestation"
+			return check
+		}
+		check.Details["server_validated"] = true
 	}
 
 	check.Passed = true

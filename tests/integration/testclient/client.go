@@ -9,8 +9,14 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"database/sql"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"io"
 	"math/big"
+	"net/http"
+	"os"
+	"strings"
 	"time"
 
 	_ "github.com/lib/pq" // PostgreSQL driver for CockroachDB
@@ -57,6 +63,70 @@ func NewTestClient() (*TestClient, error) {
 	return &TestClient{
 		privateKey: privateKey,
 	}, nil
+}
+
+// NewAttestedClient creates a test client with automatic attester detection
+// Uses SEV-SNP if /dev/sev-guest exists, otherwise uses simulated attestation
+func NewAttestedClient() (*TestClient, error) {
+	return NewTestClient()
+}
+
+// GetAttester automatically detects and returns the appropriate attester
+// Returns SEV-SNP attester if /dev/sev-guest exists, otherwise creates mock evidence
+func GetAttester() (attestation.Attester, error) {
+	// Check if SEV-SNP device exists
+	if _, err := os.Stat("/dev/sev-guest"); err == nil {
+		// SEV-SNP hardware available
+		fmt.Println("✓ Detected SEV-SNP hardware (/dev/sev-guest)")
+		return attestation.NewSEVSNPAttester()
+	}
+
+	// Fall back to mock attestation
+	fmt.Println("ℹ Using mock attestation (no /dev/sev-guest found)")
+	return nil, nil // Return nil to indicate we should use mock evidence
+}
+
+// FetchNonceFromProxy requests a fresh nonce from the proxy's HTTP API
+func FetchNonceFromProxy(proxyAPIAddr string) ([]byte, error) {
+	// Extract host from address (remove :port if present from TLS address)
+	// and build API URL
+	host := proxyAPIAddr
+	if idx := strings.Index(host, ":"); idx >= 0 {
+		host = host[:idx]
+	}
+
+	// Try common API port 8081
+	apiURL := fmt.Sprintf("http://%s:8081/api/v1/nonce", host)
+
+	resp, err := http.Get(apiURL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch nonce from %s: %w", apiURL, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("nonce request failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var nonceResp struct {
+		Nonce     string `json:"nonce"`
+		ExpiresIn int    `json:"expires_in"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&nonceResp); err != nil {
+		return nil, fmt.Errorf("failed to decode nonce response: %w", err)
+	}
+
+	// Decode hex nonce
+	nonce, err := hex.DecodeString(nonceResp.Nonce)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode hex nonce: %w", err)
+	}
+
+	fmt.Printf("✓ Fetched nonce from proxy (%d bytes, expires in %ds)\n", len(nonce), nonceResp.ExpiresIn)
+
+	return nonce, nil
 }
 
 // GenerateCertificate generates a self-signed certificate with attestation extension
@@ -117,6 +187,62 @@ func (c *TestClient) Connect(addr string) (*tls.Conn, error) {
 	}
 
 	return conn, nil
+}
+
+// ConnectWithAttestation automatically generates attestation and connects to the proxy
+// This is a convenience method that detects the environment and uses the appropriate attester
+func (c *TestClient) ConnectWithAttestation(addr string) (*tls.Conn, error) {
+	// Get appropriate attester based on environment
+	attester, err := GetAttester()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get attester: %w", err)
+	}
+
+	var evidence *attestation.AttestationEvidence
+	var nonce []byte
+
+	// Try to fetch nonce from proxy (this enables proper nonce validation)
+	nonce, err = FetchNonceFromProxy(addr)
+	if err != nil {
+		// If we can't fetch nonce, generate our own (will likely fail validation)
+		fmt.Printf("⚠ Could not fetch nonce from proxy: %v\n", err)
+		fmt.Println("⚠ Generating self-generated nonce (may fail validation)")
+		nonce = make([]byte, 32)
+		if _, err := rand.Read(nonce); err != nil {
+			return nil, fmt.Errorf("failed to generate nonce: %w", err)
+		}
+	}
+
+	if attester != nil {
+		// Real SEV-SNP attestation
+		defer attester.Close()
+
+		// Get attestation evidence with the nonce
+		evidence, err = attester.GetReport(nonce)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get attestation evidence: %w", err)
+		}
+	} else {
+		// Mock attestation for testing
+		params := AttestationParams{
+			DebugEnabled: true,
+			SMTEnabled:   true,
+			TCBVersion:   "1.51.0",
+			Nonce:        nonce,
+		}
+		evidence, err = CreateMockEvidence(params)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create mock evidence: %w", err)
+		}
+	}
+
+	// Generate certificate with attestation
+	if err := c.GenerateCertificate(evidence); err != nil {
+		return nil, fmt.Errorf("failed to generate certificate: %w", err)
+	}
+
+	// Connect to proxy
+	return c.Connect(addr)
 }
 
 // ConnectDB establishes a database connection through the proxy

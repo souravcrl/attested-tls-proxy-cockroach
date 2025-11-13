@@ -1,20 +1,32 @@
 package api
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/cockroachdb/attested-tls-proxy-cockroach/internal/logger"
 	"github.com/cockroachdb/attested-tls-proxy-cockroach/pkg/attestation"
 )
 
+// nonceEntry stores a nonce with expiration
+type nonceEntry struct {
+	nonce     []byte
+	createdAt time.Time
+}
+
 // Server provides HTTP API for attestation data
 type Server struct {
 	store       *attestation.AttestationStore
 	proxyNodeID string
 	mux         *http.ServeMux
+	nonces      map[string]*nonceEntry // Map of nonce hex -> entry
+	nonceMutex  sync.RWMutex
+	nonceTTL    time.Duration
 }
 
 // NewServer creates a new HTTP API server
@@ -23,14 +35,21 @@ func NewServer(store *attestation.AttestationStore, proxyNodeID string) *Server 
 		store:       store,
 		proxyNodeID: proxyNodeID,
 		mux:         http.NewServeMux(),
+		nonces:      make(map[string]*nonceEntry),
+		nonceTTL:    5 * time.Minute, // 5 minute expiration for nonces
 	}
 
 	s.registerHandlers()
+
+	// Start cleanup goroutine for expired nonces
+	go s.cleanupExpiredNonces()
+
 	return s
 }
 
 // registerHandlers sets up all HTTP route handlers
 func (s *Server) registerHandlers() {
+	s.mux.HandleFunc("/api/v1/nonce", s.handleNonce)
 	s.mux.HandleFunc("/api/v1/attestations", s.handleAttestations)
 	s.mux.HandleFunc("/api/v1/clients", s.handleClients)
 	s.mux.HandleFunc("/api/v1/clients/active", s.handleActiveClients)
@@ -288,4 +307,89 @@ type NodeInfoResponse struct {
 	NodeID    string `json:"node_id"`
 	Version   string `json:"version"`
 	Timestamp string `json:"timestamp"`
+}
+
+// handleNonce generates a fresh nonce for attestation
+func (s *Server) handleNonce(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Generate 32-byte random nonce
+	nonce := make([]byte, 32)
+	if _, err := rand.Read(nonce); err != nil {
+		logger.Log.Error().Err(err).Msg("Failed to generate nonce")
+		http.Error(w, "Failed to generate nonce", http.StatusInternalServerError)
+		return
+	}
+
+	// Store nonce with expiration
+	nonceHex := hex.EncodeToString(nonce)
+	entry := &nonceEntry{
+		nonce:     nonce,
+		createdAt: time.Now(),
+	}
+
+	s.nonceMutex.Lock()
+	s.nonces[nonceHex] = entry
+	s.nonceMutex.Unlock()
+
+	logger.Log.Debug().
+		Str("nonce_hex", nonceHex[:16]+"...").
+		Msg("Generated nonce for attestation")
+
+	response := map[string]interface{}{
+		"nonce":      nonceHex,
+		"expires_in": int(s.nonceTTL.Seconds()),
+		"timestamp":  time.Now().Format(time.RFC3339),
+	}
+
+	s.respondJSON(w, response)
+}
+
+// ValidateNonce checks if a nonce exists and hasn't expired
+func (s *Server) ValidateNonce(nonce []byte) bool {
+	nonceHex := hex.EncodeToString(nonce)
+
+	s.nonceMutex.RLock()
+	entry, exists := s.nonces[nonceHex]
+	s.nonceMutex.RUnlock()
+
+	if !exists {
+		return false
+	}
+
+	// Check if expired
+	if time.Since(entry.createdAt) > s.nonceTTL {
+		// Clean up expired nonce
+		s.nonceMutex.Lock()
+		delete(s.nonces, nonceHex)
+		s.nonceMutex.Unlock()
+		return false
+	}
+
+	// Nonce is valid - consume it (one-time use)
+	s.nonceMutex.Lock()
+	delete(s.nonces, nonceHex)
+	s.nonceMutex.Unlock()
+
+	return true
+}
+
+// cleanupExpiredNonces periodically removes expired nonces
+func (s *Server) cleanupExpiredNonces() {
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		s.nonceMutex.Lock()
+		now := time.Now()
+		for nonceHex, entry := range s.nonces {
+			if now.Sub(entry.createdAt) > s.nonceTTL {
+				delete(s.nonces, nonceHex)
+			}
+		}
+		s.nonceMutex.Unlock()
+	}
 }

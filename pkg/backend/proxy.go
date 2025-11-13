@@ -454,6 +454,11 @@ func (p *Proxy) GetAttestationStore() *attestation.AttestationStore {
 	return p.attestationStore
 }
 
+// GetVerifier returns the attestation verifier
+func (p *Proxy) GetVerifier() *policy.Verifier {
+	return p.verifier
+}
+
 // isRunning checks if the proxy is running
 func (p *Proxy) isRunning() bool {
 	p.mu.Lock()

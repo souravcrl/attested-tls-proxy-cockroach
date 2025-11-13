@@ -7,36 +7,35 @@ package attestation
 #include <errno.h>
 #include <string.h>
 
-// SEV-SNP ioctl commands
+// SEV-SNP ioctl commands (updated for kernel 6.8+)
 // Reference: linux/include/uapi/linux/sev-guest.h
-#define SNP_GET_REPORT _IOWR('S', 0x01, struct snp_guest_request_ioctl)
-#define SNP_GET_DERIVED_KEY _IOWR('S', 0x02, struct snp_guest_request_ioctl)
-#define SNP_GET_EXT_REPORT _IOWR('S', 0x03, struct snp_guest_request_ioctl)
+#define SNP_GUEST_REQ_IOC_TYPE 'S'
+#define SNP_GET_REPORT _IOWR(SNP_GUEST_REQ_IOC_TYPE, 0x0, struct snp_guest_request_ioctl)
+#define SNP_GET_DERIVED_KEY _IOWR(SNP_GUEST_REQ_IOC_TYPE, 0x1, struct snp_guest_request_ioctl)
+#define SNP_GET_EXT_REPORT _IOWR(SNP_GUEST_REQ_IOC_TYPE, 0x2, struct snp_guest_request_ioctl)
 
-// ioctl request structure
+// ioctl request structure (kernel 6.8+)
 struct snp_guest_request_ioctl {
+    uint8_t msg_version;      // message version (must be non-zero)
     uint64_t req_data;
     uint64_t resp_data;
-    uint64_t exit_info2;
+    uint64_t exitinfo2;       // bits[63:32]: VMM error, bits[31:0]: FW error
 };
 
 // Request structure for SNP_GET_REPORT
 struct snp_report_req {
-    uint8_t report_data[64];  // User-provided nonce
+    uint8_t user_data[64];    // User-provided nonce
     uint32_t vmpl;            // VM Permission Level
     uint8_t rsvd[28];         // Reserved
 };
 
-// Response structure for SNP_GET_REPORT
+// Response structure for SNP_GET_REPORT (kernel 6.8+)
 struct snp_report_resp {
-    uint32_t status;          // Status code
-    uint32_t report_size;     // Size of report
-    uint8_t rsvd[24];         // Reserved
-    uint8_t report[1184];     // The actual attestation report
+    uint8_t data[4000];       // Response data (includes report)
 };
 
-// Wrapper function to call ioctl safely
-static int get_attestation_report(int fd, uint8_t *nonce, size_t nonce_len, uint8_t *report_out, uint64_t *exit_info2) {
+// Wrapper function to call ioctl safely (updated for kernel 6.8+)
+static int get_attestation_report(int fd, uint8_t *nonce, size_t nonce_len, uint8_t *report_out, uint64_t *exit_info2, int *error_code) {
     struct snp_report_req req;
     struct snp_report_resp resp;
     struct snp_guest_request_ioctl ioctl_req;
@@ -50,29 +49,28 @@ static int get_attestation_report(int fd, uint8_t *nonce, size_t nonce_len, uint
     if (nonce_len > 64) {
         nonce_len = 64;
     }
-    memcpy(req.report_data, nonce, nonce_len);
+    memcpy(req.user_data, nonce, nonce_len);
     req.vmpl = 0;  // VM Permission Level 0 (most privileged)
 
     // Setup ioctl request
+    ioctl_req.msg_version = 1;  // Message version must be non-zero
     ioctl_req.req_data = (uint64_t)&req;
     ioctl_req.resp_data = (uint64_t)&resp;
-    ioctl_req.exit_info2 = 0;
+    ioctl_req.exitinfo2 = 0;
 
     // Call ioctl
+    errno = 0;  // Clear errno before call
     int ret = ioctl(fd, SNP_GET_REPORT, &ioctl_req);
+    *error_code = errno;  // Capture actual errno
+    *exit_info2 = ioctl_req.exitinfo2;
+
     if (ret != 0) {
-        *exit_info2 = ioctl_req.exit_info2;
         return ret;
     }
 
-    // Check response status
-    if (resp.status != 0) {
-        return -1;
-    }
-
-    // Copy report to output
-    memcpy(report_out, resp.report, 1184);
-    *exit_info2 = ioctl_req.exit_info2;
+    // The report is in the first 1184 bytes of resp.data
+    // See AMD SEV-SNP spec: attestation report is 1184 bytes
+    memcpy(report_out, resp.data, 1184);
 
     return 0;
 }
@@ -131,6 +129,7 @@ func (a *SEVSNPAttester) GetReport(nonce []byte) (*AttestationEvidence, error) {
 	// Prepare buffer for report
 	reportBuf := make([]byte, ReportSize)
 	var exitInfo2 C.uint64_t
+	var errorCode C.int
 
 	// Call ioctl via CGo
 	nonceBuf := make([]byte, MaxNonceSize)
@@ -142,11 +141,12 @@ func (a *SEVSNPAttester) GetReport(nonce []byte) (*AttestationEvidence, error) {
 		C.size_t(len(nonce)),
 		(*C.uint8_t)(unsafe.Pointer(&reportBuf[0])),
 		&exitInfo2,
+		&errorCode,
 	)
 
 	if ret != 0 {
-		return nil, fmt.Errorf("ioctl SNP_GET_REPORT failed: ret=%d, exit_info2=0x%x, errno=%d",
-			ret, exitInfo2, syscall.Errno(ret))
+		return nil, fmt.Errorf("ioctl SNP_GET_REPORT failed: ret=%d, exit_info2=0x%x, errno=%d (%s)",
+			ret, exitInfo2, errorCode, syscall.Errno(errorCode))
 	}
 
 	// Parse the report
