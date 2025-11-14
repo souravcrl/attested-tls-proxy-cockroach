@@ -306,11 +306,26 @@ func CreateMockEvidence(params AttestationParams) (*attestation.AttestationEvide
 		}
 	}
 
+	// Generate random measurement if not provided (all zeros)
+	measurement := params.Measurement
+	isZero := true
+	for _, b := range measurement {
+		if b != 0 {
+			isZero = false
+			break
+		}
+	}
+	if isZero {
+		if _, err := rand.Read(measurement[:]); err != nil {
+			return nil, fmt.Errorf("failed to generate measurement: %w", err)
+		}
+	}
+
 	// Create mock attestation report
 	report := &attestation.AttestationReport{
 		Version:         2,
 		GuestSVN:        params.GuestSVN,
-		Measurement:     params.Measurement,
+		Measurement:     measurement,
 		PlatformVersion: params.PlatformVersion,
 	}
 
@@ -329,17 +344,23 @@ func CreateMockEvidence(params AttestationParams) (*attestation.AttestationEvide
 	// Set policy bits for debug and SMT
 	policy := uint64(0)
 	if params.DebugEnabled {
-		policy |= (1 << 19) // Debug bit
+		policy |= 0x01 // Debug bit (bit 0)
 	}
-	if !params.SMTEnabled {
-		policy |= (1 << 16) // SMT disabled bit
+	if params.SMTEnabled {
+		policy |= (1 << 32) // SMT enabled - set any bit in range 32-47
 	}
 	report.Policy = policy
 
 	// Copy nonce to report data
 	copy(report.ReportData[:], nonce)
 
-	// Generate random chip ID and signature (mock)
+	// Generate random FamilyID, ImageID, ChipID and signature (mock)
+	if _, err := rand.Read(report.FamilyID[:]); err != nil {
+		return nil, fmt.Errorf("failed to generate family ID: %w", err)
+	}
+	if _, err := rand.Read(report.ImageID[:]); err != nil {
+		return nil, fmt.Errorf("failed to generate image ID: %w", err)
+	}
 	if _, err := rand.Read(report.ChipID[:]); err != nil {
 		return nil, fmt.Errorf("failed to generate chip ID: %w", err)
 	}

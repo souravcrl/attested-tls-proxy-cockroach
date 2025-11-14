@@ -58,6 +58,9 @@ cleanup() {
     pkill -f "connect_to_cluster" 2>/dev/null || true
     pkill -f "test_nonce_clients" 2>/dev/null || true
 
+    # Clean up CockroachDB data directories to avoid lock issues
+    rm -rf cockroach-data 2>/dev/null || true
+
     # Clean up old attestation databases
     rm -f /tmp/attestations-node*.db
     rm -f /tmp/atls-proxy-audit-node*.json
@@ -83,8 +86,8 @@ if [ -e "/dev/sev-guest" ]; then
 elif [ "$(uname)" == "Darwin" ]; then
     echo "  ℹ Running on macOS - using mock attestation"
     ATTESTATION_MODE="mock"
-    export CGO_CFLAGS="-I/opt/homebrew/opt/openssl@3/include"
-    export CGO_LDFLAGS="-L/opt/homebrew/opt/openssl@3/lib -lcrypto"
+    export CGO_CFLAGS="-I/opt/homebrew/Cellar/openssl@3/3.6.0/include"
+    export CGO_LDFLAGS="-L/opt/homebrew/Cellar/openssl@3/3.6.0/lib -lcrypto"
 else
     echo "  ℹ Running on Linux (no SEV-SNP) - using mock attestation"
     ATTESTATION_MODE="mock"
@@ -94,11 +97,15 @@ fi
 
 # Build binaries
 echo -e "${GREEN}Building binaries...${NC}"
+
+# Build React dashboard
+echo "  Building React dashboard..."
+cd dashboard-ui
+npm run build || { echo "Failed to build React dashboard"; exit 1; }
+cd ..
+
 echo "  Building proxy..."
 go build -o attested-tls-proxy ./cmd/proxy || { echo "Failed to build proxy"; exit 1; }
-
-echo "  Building dashboard..."
-go build -o dashboard ./cmd/dashboard || { echo "Failed to build dashboard"; exit 1; }
 
 echo -e "${GREEN}✓ Binaries built successfully${NC}"
 echo -e "${YELLOW}Attestation mode: $ATTESTATION_MODE${NC}\n"
@@ -173,10 +180,9 @@ echo "Proxy 3 PID: $PROXY3_PID"
 
 sleep 2
 
-echo -e "${GREEN}Step 8: Starting Dashboard (port 9090)${NC}"
-./dashboard -config config/dashboard-cluster.yaml > /tmp/dashboard.log 2>&1 &
-DASHBOARD_PID=$!
-echo "Dashboard PID: $DASHBOARD_PID"
+echo -e "${GREEN}Step 8: React Dashboard${NC}"
+echo "  Dashboard is served by each proxy's HTTP API server"
+echo "  Open http://localhost:8081 to view the dashboard"
 
 sleep 3
 
@@ -186,12 +192,12 @@ echo "  - Node 1: localhost:26258 (Admin UI: http://localhost:8091)"
 echo "  - Node 2: localhost:26268 (Admin UI: http://localhost:8092)"
 echo "  - Node 3: localhost:26278 (Admin UI: http://localhost:8093)"
 echo ""
-echo "Attested TLS Proxies:"
-echo "  - Proxy 1: localhost:26257 -> CRDB localhost:26258 (API: http://localhost:8081)"
-echo "  - Proxy 2: localhost:26267 -> CRDB localhost:26268 (API: http://localhost:8082)"
-echo "  - Proxy 3: localhost:26277 -> CRDB localhost:26278 (API: http://localhost:8083)"
+echo "Attested TLS Proxies (with React Dashboard):"
+echo "  - Proxy 1: localhost:26257 -> CRDB localhost:26258 (Dashboard: http://localhost:8081)"
+echo "  - Proxy 2: localhost:26267 -> CRDB localhost:26268 (Dashboard: http://localhost:8082)"
+echo "  - Proxy 3: localhost:26277 -> CRDB localhost:26278 (Dashboard: http://localhost:8083)"
 echo ""
-echo -e "${GREEN}Dashboard: ${YELLOW}http://localhost:9090${NC}"
+echo -e "${GREEN}Dashboard: ${YELLOW}http://localhost:8081${NC} (or 8082, 8083)"
 echo ""
 
 # Wait for services to be ready
@@ -200,11 +206,11 @@ sleep 5
 
 # Check if services are responding
 echo -e "${GREEN}Step 9: Verifying services...${NC}"
-curl -s http://localhost:8081/api/v1/health > /dev/null && echo "  ✓ Proxy 1 API responding" || echo "  ✗ Proxy 1 API not responding"
-curl -s http://localhost:8082/api/v1/health > /dev/null && echo "  ✓ Proxy 2 API responding" || echo "  ✗ Proxy 2 API not responding"
-curl -s http://localhost:8083/api/v1/health > /dev/null && echo "  ✓ Proxy 3 API responding" || echo "  ✗ Proxy 3 API not responding"
-curl -s http://localhost:9090 > /dev/null && echo "  ✓ Dashboard responding" || echo "  ✗ Dashboard not responding"
+curl -s http://localhost:8081/api/v1/health > /dev/null && echo "  ✓ Proxy 1 Dashboard & API responding" || echo "  ✗ Proxy 1 not responding"
+curl -s http://localhost:8082/api/v1/health > /dev/null && echo "  ✓ Proxy 2 Dashboard & API responding" || echo "  ✗ Proxy 2 not responding"
+curl -s http://localhost:8083/api/v1/health > /dev/null && echo "  ✓ Proxy 3 Dashboard & API responding" || echo "  ✗ Proxy 3 not responding"
 echo "  ✓ Nonce endpoint available at: http://localhost:8081/api/v1/nonce"
+curl -s http://localhost:8081/ > /dev/null && echo "  ✓ React dashboard available at: http://localhost:8081" || echo "  ✗ React dashboard not responding"
 
 echo ""
 echo -e "${GREEN}Step 10: Running test clients (showing both DENIED and ALLOWED)...${NC}"
@@ -359,7 +365,7 @@ fi
 
 echo ""
 echo -e "${GREEN}View Results:${NC}"
-echo -e "  ${YELLOW}Dashboard: http://localhost:9090${NC}"
+echo -e "  ${YELLOW}React Dashboard: http://localhost:8081${NC} (or 8082, 8083)"
 echo "  You should see:"
 echo "    - DENIED clients (self-generated nonce)"
 echo "    - ALLOWED clients (proxy-provided nonce)"
@@ -396,13 +402,7 @@ echo ""
 while true; do
     sleep 5
 
-    # Check if all services are still running
-    if ! kill -0 $DASHBOARD_PID 2>/dev/null; then
-        echo -e "\n${RED}Dashboard stopped unexpectedly!${NC}"
-        tail -20 /tmp/dashboard.log
-        break
-    fi
-
+    # Check if proxies are still running
     running_proxies=0
     for pid in "${PROXY_PIDS[@]}"; do
         if kill -0 $pid 2>/dev/null; then

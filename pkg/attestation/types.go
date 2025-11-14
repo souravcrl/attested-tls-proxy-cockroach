@@ -1,6 +1,7 @@
 package attestation
 
 import (
+	"crypto/rand"
 	"encoding/binary"
 	"fmt"
 	"time"
@@ -403,24 +404,47 @@ func NewMockAttester() *MockAttester {
 	}
 }
 
-// GetReport returns a mock attestation report
+// GetReport returns a mock attestation report with unique measurements
 func (m *MockAttester) GetReport(nonce []byte) (*AttestationEvidence, error) {
+	// Generate unique measurement (48 bytes for SEV-SNP)
+	measurement := make([]byte, 48)
+	if _, err := rand.Read(measurement); err != nil {
+		return nil, fmt.Errorf("failed to generate mock measurement: %w", err)
+	}
+
+	// Vary TCB versions for realistic demo (1.51, 1.52, 1.53)
+	tcbVersions := []struct{ major, minor, build uint8 }{
+		{1, 51, 0},
+		{1, 52, 0},
+		{1, 53, 0},
+	}
+	tcbVersion := tcbVersions[int(measurement[0])%len(tcbVersions)]
+
+	// Vary policy flags (debug/SMT) for interesting dashboard data
+	// Most should be secure (no debug, no SMT), but vary a few
+	policy := uint64(0x30000) // Default: no debug, no SMT
+	if measurement[1]%10 == 0 {
+		policy = 0x10000 // Debug enabled
+	} else if measurement[1]%10 == 1 {
+		policy = 0x20000 // SMT enabled
+	}
+
 	// Create a fake report for testing
 	report := &AttestationReport{
-		Version:      1,
-		GuestSVN:     1,
-		Policy:       0x30000, // No debug, no SMT
-		SignatureAlgo: 1,      // ECDSA P-384
-		CurrentMajor: 1,
-		CurrentMinor: 51,
-		CurrentBuild: 0,
+		Version:       1,
+		GuestSVN:      1,
+		Policy:        policy,
+		SignatureAlgo: 1, // ECDSA P-384
+		CurrentMajor:  tcbVersion.major,
+		CurrentMinor:  tcbVersion.minor,
+		CurrentBuild:  tcbVersion.build,
 	}
 
 	// Copy nonce to report data
 	copy(report.ReportData[:], nonce)
 
-	// Fake measurement (for testing)
-	copy(report.Measurement[:], []byte("MOCK_MEASUREMENT_FOR_TESTING_ONLY_____"))
+	// Copy unique measurement
+	copy(report.Measurement[:], measurement)
 
 	return &AttestationEvidence{
 		Report:       report,

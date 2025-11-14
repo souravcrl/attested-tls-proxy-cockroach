@@ -34,6 +34,11 @@ type ClientAttestation struct {
 	BytesIn        int64      `json:"bytes_in"`
 	BytesOut       int64      `json:"bytes_out"`
 	ProxyNodeID    string     `json:"proxy_node_id"`    // This proxy's ID
+
+	// Additional attestation report fields
+	FamilyID       string     `json:"family_id,omitempty"`      // 16-byte family identifier (hex)
+	ImageID        string     `json:"image_id,omitempty"`       // 16-byte image identifier (hex)
+	ChipID         string     `json:"chip_id,omitempty"`        // 64-byte chip identifier (hex, truncated for display)
 }
 
 // NewAttestationStore creates a new attestation store with SQLite backend
@@ -66,6 +71,9 @@ func NewAttestationStore(dbPath string) (*AttestationStore, error) {
 			bytes_in INTEGER DEFAULT 0,
 			bytes_out INTEGER DEFAULT 0,
 			proxy_node_id TEXT,
+			family_id TEXT,
+			image_id TEXT,
+			chip_id TEXT,
 			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 		);
 
@@ -80,6 +88,18 @@ func NewAttestationStore(dbPath string) (*AttestationStore, error) {
 		return nil, fmt.Errorf("failed to create schema: %w", err)
 	}
 
+	// Migrate existing tables to add new columns if they don't exist
+	migrations := []string{
+		"ALTER TABLE client_attestations ADD COLUMN family_id TEXT",
+		"ALTER TABLE client_attestations ADD COLUMN image_id TEXT",
+		"ALTER TABLE client_attestations ADD COLUMN chip_id TEXT",
+	}
+
+	for _, migration := range migrations {
+		// Ignore errors if column already exists
+		db.Exec(migration)
+	}
+
 	logger.Log.Info().
 		Str("db_path", dbPath).
 		Msg("Attestation store initialized")
@@ -92,14 +112,15 @@ func (s *AttestationStore) RecordAttestation(att *ClientAttestation) error {
 	query := `
 		INSERT INTO client_attestations (
 			id, client_id, measurement, tcb_version, debug_enabled, smt_enabled,
-			nonce, timestamp, verify_result, verify_reason, connected_at, proxy_node_id
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			nonce, timestamp, verify_result, verify_reason, connected_at, proxy_node_id,
+			family_id, image_id, chip_id
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`
 
 	_, err := s.db.Exec(query,
 		att.ID, att.ClientID, att.Measurement, att.TCBVersion, att.DebugEnabled,
 		att.SMTEnabled, att.Nonce, att.Timestamp, att.VerifyResult, att.VerifyReason,
-		att.ConnectedAt, att.ProxyNodeID)
+		att.ConnectedAt, att.ProxyNodeID, att.FamilyID, att.ImageID, att.ChipID)
 
 	if err != nil {
 		return fmt.Errorf("failed to insert attestation: %w", err)
@@ -146,7 +167,8 @@ func (s *AttestationStore) GetRecentAttestations(limit int) ([]*ClientAttestatio
 	query := `
 		SELECT id, client_id, measurement, tcb_version, debug_enabled, smt_enabled,
 		       nonce, timestamp, verify_result, verify_reason, connected_at,
-		       disconnected_at, bytes_in, bytes_out, proxy_node_id
+		       disconnected_at, bytes_in, bytes_out, proxy_node_id,
+		       family_id, image_id, chip_id
 		FROM client_attestations
 		ORDER BY connected_at DESC
 		LIMIT ?
@@ -166,7 +188,8 @@ func (s *AttestationStore) GetActiveClients() ([]*ClientAttestation, error) {
 	query := `
 		SELECT id, client_id, measurement, tcb_version, debug_enabled, smt_enabled,
 		       nonce, timestamp, verify_result, verify_reason, connected_at,
-		       disconnected_at, bytes_in, bytes_out, proxy_node_id
+		       disconnected_at, bytes_in, bytes_out, proxy_node_id,
+		       family_id, image_id, chip_id
 		FROM client_attestations
 		WHERE disconnected_at IS NULL AND verify_result = 'allowed'
 		ORDER BY connected_at DESC
@@ -186,7 +209,8 @@ func (s *AttestationStore) GetByClientID(clientID string) ([]*ClientAttestation,
 	query := `
 		SELECT id, client_id, measurement, tcb_version, debug_enabled, smt_enabled,
 		       nonce, timestamp, verify_result, verify_reason, connected_at,
-		       disconnected_at, bytes_in, bytes_out, proxy_node_id
+		       disconnected_at, bytes_in, bytes_out, proxy_node_id,
+		       family_id, image_id, chip_id
 		FROM client_attestations
 		WHERE client_id = ?
 		ORDER BY connected_at DESC
@@ -293,15 +317,28 @@ func (s *AttestationStore) scanAttestations(rows *sql.Rows) ([]*ClientAttestatio
 
 	for rows.Next() {
 		att := &ClientAttestation{}
+		var familyID, imageID, chipID sql.NullString
 		err := rows.Scan(
 			&att.ID, &att.ClientID, &att.Measurement, &att.TCBVersion,
 			&att.DebugEnabled, &att.SMTEnabled, &att.Nonce, &att.Timestamp,
 			&att.VerifyResult, &att.VerifyReason, &att.ConnectedAt,
 			&att.DisconnectedAt, &att.BytesIn, &att.BytesOut, &att.ProxyNodeID,
+			&familyID, &imageID, &chipID,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan attestation: %w", err)
 		}
+
+		if familyID.Valid {
+			att.FamilyID = familyID.String
+		}
+		if imageID.Valid {
+			att.ImageID = imageID.String
+		}
+		if chipID.Valid {
+			att.ChipID = chipID.String
+		}
+
 		attestations = append(attestations, att)
 	}
 
@@ -319,6 +356,11 @@ func CreateAttestationFromEvidence(
 	measurementHex := hex.EncodeToString(evidence.Report.Measurement[:])
 	clientID := measurementHex[:16] // First 8 bytes (16 hex chars)
 
+	// Extract identifiers from report
+	familyID := hex.EncodeToString(evidence.Report.FamilyID[:])
+	imageID := hex.EncodeToString(evidence.Report.ImageID[:])
+	chipID := hex.EncodeToString(evidence.Report.ChipID[:16]) // First 16 bytes for display
+
 	return &ClientAttestation{
 		ID:           generateID(),
 		ClientID:     clientID,
@@ -332,6 +374,9 @@ func CreateAttestationFromEvidence(
 		VerifyReason: verifyReason,
 		ConnectedAt:  time.Now(),
 		ProxyNodeID:  proxyNodeID,
+		FamilyID:     familyID,
+		ImageID:      imageID,
+		ChipID:       chipID,
 	}
 }
 
