@@ -3456,7 +3456,407 @@ func BenchmarkProxyThroughput(b *testing.B) {
 
 1. **STS Provider**: Will you use an existing STS (e.g., GCP STS) or build custom?
 2. **Verifier Service**: Use Veraison, Azure Attestation, or custom verifier?
+   - **Current Decision (Phase 2.5)**: Embedded verifier (valid per RFC 9334 Section 7.2.2)
+   - **Future (Phase 3.3)**: Optional external verifier support
 3. **Certificate Management**: How will you rotate proxy certificates?
 4. **Multi-tenant**: Will you support multiple CRDB tenants through one proxy?
+5. **Reference Value Distribution**: How to distribute measurements?
+   - **Current (Phase 2.5)**: Local YAML policy file
+   - **Planned (Phase 3.1)**: AMD KDS for certificate endorsements
+   - **Planned (Phase 3.2)**: CoRIM repositories for measurements
+   - **Planned (Phase 3.3)**: External verifier with RVPS
+
+---
+
+## Phase 3 Extensions: Reference Value Distribution & External Verifiers
+
+### 3.1 AMD KDS Integration (Vendor Endorsements)
+
+**Objective:** Automatically fetch and cache AMD certificate chains instead of manual configuration
+
+**File:** `pkg/attestation/kds_client.go`
+```go
+package attestation
+
+import (
+    "fmt"
+    "net/http"
+    "time"
+)
+
+type KDSClient struct {
+    baseURL     string
+    httpClient  *http.Client
+    certCache   map[string]*CachedCertChain
+    cacheMutex  sync.RWMutex
+}
+
+type CachedCertChain struct {
+    VCEK      []byte
+    ASK       []byte
+    ARK       []byte
+    FetchedAt time.Time
+}
+
+func NewKDSClient() *KDSClient {
+    return &KDSClient{
+        baseURL: "https://kdsintf.amd.com",
+        httpClient: &http.Client{Timeout: 10 * time.Second},
+        certCache: make(map[string]*CachedCertChain),
+    }
+}
+
+// FetchCertificateChain downloads VCEK, ASK, ARK from AMD KDS
+func (k *KDSClient) FetchCertificateChain(chipID [64]byte, tcbVersion string) (*CachedCertChain, error) {
+    chipIDHex := hex.EncodeToString(chipID[:])
+
+    // Check cache first (valid for 24 hours)
+    k.certCacheMutex.RLock()
+    cached, ok := k.certCache[chipIDHex]
+    k.certCacheMutex.RUnlock()
+    if ok && time.Since(cached.FetchedAt) < 24*time.Hour {
+        return cached, nil
+    }
+
+    // Fetch VCEK (chip-specific)
+    vcekURL := fmt.Sprintf("%s/vcek/v1/Milan/%s?tcb=%s", k.baseURL, chipIDHex, tcbVersion)
+    vcek, err := k.fetchCertificate(vcekURL)
+    if err != nil {
+        return nil, fmt.Errorf("failed to fetch VCEK: %w", err)
+    }
+
+    // Fetch ASK + ARK chain
+    certChainURL := fmt.Sprintf("%s/vcek/v1/Milan/cert_chain", k.baseURL)
+    certChain, err := k.fetchCertificate(certChainURL)
+    if err != nil {
+        return nil, fmt.Errorf("failed to fetch cert chain: %w", err)
+    }
+
+    // Parse ASK and ARK from chain
+    ask, ark, err := parseCertChain(certChain)
+    if err != nil {
+        return nil, err
+    }
+
+    chain := &CachedCertChain{
+        VCEK:      vcek,
+        ASK:       ask,
+        ARK:       ark,
+        FetchedAt: time.Now(),
+    }
+
+    // Cache for 24 hours
+    k.certCacheMutex.Lock()
+    k.certCache[chipIDHex] = chain
+    k.certCacheMutex.Unlock()
+
+    return chain, nil
+}
+```
+
+**Integration into Verifier:**
+```go
+// pkg/policy/verifier.go
+func (v *Verifier) verifyCertificateChain(evidence *attestation.AttestationEvidence) CheckResult {
+    // If certificates not in evidence, fetch from AMD KDS
+    if len(evidence.Certificates) == 0 && v.kdsClient != nil {
+        chain, err := v.kdsClient.FetchCertificateChain(
+            evidence.Report.ChipID,
+            evidence.Report.GetTCBVersion(),
+        )
+        if err != nil {
+            return CheckResult{Passed: false, Message: fmt.Sprintf("KDS fetch failed: %v", err)}
+        }
+        evidence.Certificates = [][]byte{chain.VCEK, chain.ASK, chain.ARK}
+    }
+
+    // Verify signature chain
+    return v.verifySignatureChain(evidence.Certificates)
+}
+```
+
+---
+
+### 3.2 CoRIM Support (Reference Value Distribution)
+
+**Objective:** Implement IETF draft-ietf-rats-corim for distributing reference measurements
+
+**What is CoRIM?**
+- **CoRIM** = Concise Reference Integrity Manifest
+- IETF standard (draft) for packaging and distributing reference values
+- Replaces manual YAML configuration with signed manifests
+- Enables automated CI/CD integration
+
+**CoRIM Structure:**
+```json
+{
+  "corim-id": "urn:uuid:12345678-1234-5678-1234-567812345678",
+  "profile": "https://amd.com/sev-snp/v1",
+  "validity": {
+    "not-before": "2025-01-14T00:00:00Z",
+    "not-after": "2025-04-14T00:00:00Z"
+  },
+  "entities": [
+    {
+      "name": "CockroachDB Attested TLS Proxy Team",
+      "roles": ["manifest-creator", "tag-creator"]
+    }
+  ],
+  "tags": [
+    {
+      "tag-id": "atls-proxy-v1.0-gcp-ubuntu2204",
+      "environment": {
+        "class": {
+          "vendor": "GCP",
+          "model": "n2d-standard-2",
+          "instance-id": "ubuntu-2204-jammy-v20250114"
+        }
+      },
+      "measurement-values": [
+        {
+          "svn": 1,
+          "digests": [
+            {
+              "alg-id": "sha-384",
+              "value": "544553545f4d4541535552454d454e545f56414c49445f303031..."
+            }
+          ],
+          "flags": {
+            "debug-disabled": true,
+            "smt-disabled": true
+          }
+        }
+      ]
+    }
+  ],
+  "signature": {
+    "alg": "ES384",
+    "value": "base64-encoded-signature..."
+  }
+}
+```
+
+**File:** `pkg/corim/client.go`
+```go
+package corim
+
+import (
+    "encoding/json"
+    "fmt"
+    "net/http"
+)
+
+type CoRIMClient struct {
+    repositoryURL string  // https://mycompany.com/.well-known/corim
+    httpClient    *http.Client
+}
+
+type CoRIM struct {
+    CorimID  string                 `json:"corim-id"`
+    Profile  string                 `json:"profile"`
+    Validity CoRIMValidity          `json:"validity"`
+    Tags     []CoRIMTag             `json:"tags"`
+}
+
+type CoRIMTag struct {
+    TagID             string                  `json:"tag-id"`
+    MeasurementValues []CoRIMMeasurementValue `json:"measurement-values"`
+}
+
+type CoRIMMeasurementValue struct {
+    SVN     int                    `json:"svn"`
+    Digests []CoRIMDigest          `json:"digests"`
+    Flags   map[string]bool        `json:"flags"`
+}
+
+type CoRIMDigest struct {
+    AlgID string `json:"alg-id"`
+    Value string `json:"value"`
+}
+
+// FetchCoRIM downloads and parses CoRIM manifest
+func (c *CoRIMClient) FetchCoRIM(appVersion string) (*CoRIM, error) {
+    url := fmt.Sprintf("%s/atls-proxy-%s.corim", c.repositoryURL, appVersion)
+    resp, err := http.Get(url)
+    if err != nil {
+        return nil, err
+    }
+    defer resp.Body.Close()
+
+    var corim CoRIM
+    if err := json.NewDecoder(resp.Body).Decode(&corim); err != nil {
+        return nil, err
+    }
+
+    // TODO: Verify CoRIM signature
+    if err := c.verifySignature(&corim); err != nil {
+        return nil, fmt.Errorf("invalid CoRIM signature: %w", err)
+    }
+
+    return &corim, nil
+}
+
+// ExtractMeasurements gets all acceptable measurements from CoRIM
+func (c *CoRIM) ExtractMeasurements() []string {
+    var measurements []string
+    for _, tag := range c.Tags {
+        for _, mv := range tag.MeasurementValues {
+            for _, digest := range mv.Digests {
+                if digest.AlgID == "sha-384" {
+                    measurements = append(measurements, digest.Value)
+                }
+            }
+        }
+    }
+    return measurements
+}
+```
+
+**Integration into Verifier:**
+```go
+// pkg/policy/verifier.go
+func NewVerifier(policy *Policy) (*Verifier, error) {
+    v := &Verifier{policy: policy}
+
+    // If CoRIM repository configured, fetch reference values
+    if policy.CoRIM.Enabled {
+        corimClient := corim.NewCoRIMClient(policy.CoRIM.RepositoryURL)
+        corimData, err := corimClient.FetchCoRIM(policy.CoRIM.AppVersion)
+        if err != nil {
+            return nil, fmt.Errorf("failed to fetch CoRIM: %w", err)
+        }
+
+        // Extract measurements and update policy
+        measurements := corimData.ExtractMeasurements()
+        v.policy.Measurements.AllowList = append(v.policy.Measurements.AllowList, measurements...)
+
+        log.Info().
+            Int("count", len(measurements)).
+            Str("source", "corim").
+            Msg("Loaded reference values from CoRIM")
+    }
+
+    return v, nil
+}
+```
+
+**Configuration Update:**
+```yaml
+# config/attestation-policy.yaml
+corim:
+  enabled: true
+  repository_url: "https://mycompany.com/.well-known/corim"
+  app_version: "v1.0"
+  refresh_interval: "1h"  # Re-fetch CoRIM periodically
+
+measurements:
+  # Local fallback (used if CoRIM unavailable)
+  allow_list:
+    - "FALLBACK_MEASUREMENT_1"
+  mode: "strict"
+```
+
+**CI/CD Integration:**
+```bash
+# .github/workflows/build-sev-snp.yml
+- name: Extract SEV-SNP Measurement
+  run: |
+    MEASUREMENT=$(sudo dmesg | grep "SEV-SNP: measurement" | cut -d: -f2)
+    echo "measurement=$MEASUREMENT" >> $GITHUB_ENV
+
+- name: Generate CoRIM Manifest
+  run: |
+    go run cmd/corim-gen/main.go \
+      --app-version=${{ github.ref_name }} \
+      --measurement=${{ env.measurement }} \
+      --output=atls-proxy-${{ github.ref_name }}.corim
+
+- name: Sign CoRIM
+  run: |
+    cocli sign \
+      --key=${{ secrets.CORIM_SIGNING_KEY }} \
+      --in=atls-proxy-${{ github.ref_name }}.corim \
+      --out=atls-proxy-${{ github.ref_name }}.signed.corim
+
+- name: Upload to CoRIM Repository
+  run: |
+    curl -X POST https://mycompany.com/.well-known/corim/upload \
+      -H "Authorization: Bearer ${{ secrets.CORIM_UPLOAD_TOKEN }}" \
+      --data-binary @atls-proxy-${{ github.ref_name }}.signed.corim
+```
+
+---
+
+### 3.3 External Verifier Support (Veraison, Azure Attestation)
+
+**Objective:** Add option to delegate verification to external attestation services
+
+**File:** `pkg/policy/external_verifier.go`
+```go
+package policy
+
+type ExternalVerifier struct {
+    endpoint   string
+    httpClient *http.Client
+}
+
+type ExternalVerificationRequest struct {
+    Evidence    *attestation.AttestationEvidence `json:"evidence"`
+    PolicyID    string                           `json:"policy_id"`
+}
+
+type ExternalVerificationResponse struct {
+    Allowed      bool                   `json:"allowed"`
+    Reason       string                 `json:"reason"`
+    Checks       []CheckResult          `json:"checks"`
+    TCBVersion   string                 `json:"tcb_version"`
+}
+
+// VerifyAttestation sends evidence to external verifier (e.g., Veraison)
+func (e *ExternalVerifier) VerifyAttestation(
+    evidence *attestation.AttestationEvidence,
+    peerCerts []*x509.Certificate,
+) (*VerificationResult, error) {
+
+    req := &ExternalVerificationRequest{
+        Evidence: evidence,
+        PolicyID: e.policyID,
+    }
+
+    // POST to external verifier
+    resp, err := http.Post(
+        fmt.Sprintf("%s/v1/verify", e.endpoint),
+        "application/json",
+        marshalJSON(req),
+    )
+    if err != nil {
+        return nil, fmt.Errorf("external verifier request failed: %w", err)
+    }
+    defer resp.Body.Close()
+
+    var result ExternalVerificationResponse
+    if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+        return nil, err
+    }
+
+    return &VerificationResult{
+        Allowed:      result.Allowed,
+        Reason:       result.Reason,
+        PassedChecks: result.Checks,
+        TCBVersion:   result.TCBVersion,
+    }, nil
+}
+```
+
+**Configuration:**
+```yaml
+# config/attestation-policy.yaml
+verifier:
+  type: "external"  # "local" or "external"
+  external:
+    endpoint: "https://veraison.example.com"
+    policy_id: "atls-proxy-policy-v1"
+    timeout: "5s"
+```
 
 This plan provides a complete roadmap from local development to production deployment with full SEV-SNP attestation.
