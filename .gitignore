@@ -66,3 +66,40 @@ pkg/testutils/serverutils/*_generated.go
 .DS_Store
 .idea/
 .vscode/
+
+# Binaries (in addition to existing /cockroach*)
+/atls-proxy
+/attested-tls-proxy
+/dashboard
+
+# Terraform state files (CRITICAL - contain secrets/IPs)
+terraform/**/*.tfstate
+terraform/**/*.tfstate.*
+terraform/**/.terraform/
+terraform/**/tfplan
+terraform/**/deployment-info.json
+terraform/**/.terraform.lock.hcl
+
+# Node.js / Playwright
+node_modules/
+package-lock.json
+test-results/
+playwright-report/
+
+# Dashboard UI build artifacts
+dashboard-ui/dist/
+dashboard-ui/node_modules/
+
+# Temporary documentation
+CLUSTER_DEMO_SUCCESS.md
+DEMO_SUCCESS.md
+IMPLEMENTATION_STATUS.md
+
+# Generated demo files
+dashboard-demo.html
+capture-dashboard.sh
+demo-traffic.sh
+
+# Temporary test files (move to tests/ if permanent)
+/test_diverse_failures.go
+/test_nonce_clients.go
