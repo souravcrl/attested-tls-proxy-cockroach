@@ -103,3 +103,8 @@ demo-traffic.sh
 # Temporary test files (move to tests/ if permanent)
 /test_diverse_failures.go
 /test_nonce_clients.go
+
+# Python virtual environments and build scripts
+.ppt_venv/
+ppt_env/
+create_presentation.py
