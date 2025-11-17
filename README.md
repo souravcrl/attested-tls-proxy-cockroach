@@ -935,6 +935,112 @@ SEV-SNP Launch Digest = SHA-384(
 )
 ```
 
+**⚠️ Important:** The launch measurement covers **boot-time artifacts only**. It does NOT include:
+- Application binaries (e.g., `/usr/bin/atls-proxy`)
+- Configuration files (e.g., `/etc/atls-proxy/`)
+- Runtime memory contents
+- Data written after boot
+
+**Runtime Memory Integrity (RMP):**
+
+While the launch measurement verifies boot integrity, SEV-SNP provides **runtime memory protection** via the **Reverse Map Table (RMP)**:
+
+```
+┌─────────────────────────────────────────────────────┐
+│ AMD Secure Processor (PSP)                          │
+│                                                      │
+│  ┌────────────────────────────────────────────┐     │
+│  │ Reverse Map Table (RMP)                    │     │
+│  │                                             │     │
+│  │ Per-page metadata tracking:                │     │
+│  │ - Owner ASID (VM identifier)               │     │
+│  │ - GPA (Guest Physical Address)             │     │
+│  │ - Validated flag                           │     │
+│  │ - Permission bits (read/write/execute)     │     │
+│  └────────────────────────────────────────────┘     │
+└─────────────────────────────────────────────────────┘
+```
+
+**How RMP Protects Runtime Memory:**
+
+1. **Page-Level Ownership:**
+   - Every physical memory page assigned to specific VM (ASID)
+   - Hypervisor CANNOT access guest pages
+   - Hardware enforces boundaries (no software bypass)
+
+2. **Validation:**
+   - Pages must be "validated" by guest before use
+   - `PVALIDATE` instruction marks pages as guest-owned
+   - Unvalidated pages trigger exceptions
+
+3. **Integrity Checks:**
+   - Cryptographic MAC on every page
+   - Detects tampering attempts
+   - Version counter prevents replay
+
+4. **Prevents:**
+   - ❌ Hypervisor reading guest memory
+   - ❌ Hypervisor modifying guest memory
+   - ❌ Page remapping attacks
+   - ❌ Memory aliasing attacks
+
+**Application Integrity (Separate from Launch Measurement):**
+
+To verify application binaries and configs at runtime, use:
+
+**1. dm-verity (Block Device Verification):**
+```bash
+# Hash entire filesystem at build time
+veritysetup format /dev/sda1 /dev/sda2 \
+  --root-hash-file=/boot/root-hash.txt
+
+# Mount with verification
+veritysetup open /dev/sda1 /dev/sda2 root \
+  --root-hash=$(cat /boot/root-hash.txt)
+
+# Any tampering triggers I/O errors
+```
+
+**2. fs-verity (File-Level Verification):**
+```bash
+# Enable per-file hashing
+fsverity enable /usr/bin/atls-proxy
+
+# Kernel verifies on read
+# Tampering results in SIGBUS
+```
+
+**3. IMA (Integrity Measurement Architecture):**
+```bash
+# Measure all executed files
+echo "measure func=BPRM_CHECK" > /etc/ima/ima-policy
+
+# Extend measurements into TPM/vTPM
+# Attestation includes runtime measurements
+```
+
+**Recommended Stack:**
+```
+┌─────────────────────────────────────────────┐
+│ SEV-SNP Launch Measurement                  │
+│ (Firmware + Kernel + Initrd)                │
+└─────────────────────────────────────────────┘
+              ↓ Covers boot artifacts
+┌─────────────────────────────────────────────┐
+│ RMP (Reverse Map Table)                     │
+│ (Runtime memory protection)                 │
+└─────────────────────────────────────────────┘
+              ↓ Protects memory pages
+┌─────────────────────────────────────────────┐
+│ dm-verity / fs-verity / IMA                 │
+│ (Application + config integrity)            │
+└─────────────────────────────────────────────┘
+              ↓ Verifies app binaries
+┌─────────────────────────────────────────────┐
+│ Your Application (atls-proxy)               │
+└─────────────────────────────────────────────┘
+```
+
 **Scenarios That PRESERVE Measurement:**
 1. Redeploying from the **exact same VM image**:
    ```bash
@@ -1089,6 +1195,288 @@ ls -l /dev/sev-guest
 # Test attestation
 ./bin/atls-proxy --test-attestation
 ```
+
+---
+
+### CoRIM Protocol Integration (Planned - Phase 3.2)
+
+**CoRIM = Concise Reference Integrity Manifest** (IETF draft-ietf-rats-corim)
+
+A standardized format for distributing reference values in RATS (Remote ATtestation procedureS) architectures.
+
+**Problem CoRIM Solves:**
+
+Current approach (Phase 2.5):
+```yaml
+# Manual YAML configuration
+measurements:
+  allow_list:
+    - "abc123..."  # Someone manually copied this from build logs
+```
+
+**Issues:**
+- ❌ Manual copy-paste from build logs
+- ❌ No versioning or expiration
+- ❌ No cryptographic signing
+- ❌ No provenance (who generated this?)
+- ❌ Doesn't scale to multiple images/versions
+
+**CoRIM Approach (Phase 3.2):**
+
+```
+┌─────────────────────────────────────────────────────────┐
+│ CI/CD Pipeline (GitHub Actions)                          │
+│                                                           │
+│  1. Build VM image                                       │
+│  2. Boot in SEV-SNP → Extract measurement                │
+│  3. Generate CoRIM manifest                              │
+│  4. Sign with company key                                │
+│  5. Upload to CoRIM repository                           │
+└─────────────────────────────────────────────────────────┘
+                         │
+                         │ HTTPS
+                         ▼
+┌─────────────────────────────────────────────────────────┐
+│ CoRIM Repository                                         │
+│ https://mycompany.com/.well-known/corim/                │
+│                                                           │
+│  /atls-proxy-v1.0.corim  (signed manifest)              │
+│  /atls-proxy-v1.1.corim  (signed manifest)              │
+│  /atls-proxy-v1.2.corim  (signed manifest)              │
+└─────────────────────────────────────────────────────────┘
+                         │
+                         │ On startup / periodic refresh
+                         ▼
+┌─────────────────────────────────────────────────────────┐
+│ Verifier (Proxy)                                         │
+│                                                           │
+│  1. Fetch CoRIM for app version                         │
+│  2. Verify signature (company public key)               │
+│  3. Extract measurements                                 │
+│  4. Load into policy.Measurements.AllowList             │
+│  5. Use for attestation verification                     │
+└─────────────────────────────────────────────────────────┘
+```
+
+**CoRIM Manifest Structure:**
+
+```json
+{
+  "corim-id": "urn:uuid:12345678-1234-5678-1234-567812345678",
+  "profile": "https://amd.com/sev-snp/v1",
+
+  "validity": {
+    "not-before": "2025-01-14T00:00:00Z",
+    "not-after": "2025-04-14T00:00:00Z"
+  },
+
+  "entities": [
+    {
+      "name": "CockroachDB Attested TLS Proxy Team",
+      "roles": ["manifest-creator", "tag-creator"],
+      "reg-id": "https://github.com/yourorg"
+    }
+  ],
+
+  "tags": [
+    {
+      "tag-id": "atls-proxy-v1.0-gcp-ubuntu2204-20250114",
+      "tag-type": "comid",
+
+      "environment": {
+        "class": {
+          "vendor": "GCP",
+          "model": "n2d-standard-2",
+          "instance-id": "ubuntu-2204-jammy-v20250114"
+        }
+      },
+
+      "measurement-values": [
+        {
+          "version": {
+            "version": "1.0.0",
+            "version-scheme": "semver"
+          },
+          "svn": 1,
+          "digests": [
+            {
+              "alg-id": "sha-384",
+              "value": "544553545f4d4541535552454d454e545f56414c49445f303031..."
+            }
+          ],
+          "flags": {
+            "debug-disabled": true,
+            "smt-disabled": true
+          }
+        }
+      ]
+    }
+  ],
+
+  "signature": {
+    "alg": "ES384",
+    "value": "base64-encoded-ecdsa-signature",
+    "cert-chain": ["base64-cert1", "base64-cert2"]
+  }
+}
+```
+
+**Key CoRIM Components:**
+
+1. **CoMID (Concise Module Identifier):**
+   - Individual module/component description
+   - Contains measurement values
+   - Environment metadata (GCP, Azure, etc.)
+
+2. **Reference Values:**
+   - Expected measurements (SHA-384 hashes)
+   - TCB version requirements
+   - Policy flags (debug, SMT)
+
+3. **Endorsements:**
+   - Signed statements from vendor (AMD)
+   - Certificate chains (VCEK → ASK → ARK)
+
+4. **Appraisal Policies:**
+   - Which measurements are acceptable
+   - Version compatibility rules
+   - Expiration policies
+
+**Verifier Integration:**
+
+```go
+// pkg/policy/verifier.go (Phase 3.2)
+func NewVerifier(config *Config) (*Verifier, error) {
+    v := &Verifier{}
+
+    // Fetch CoRIM from repository
+    if config.CoRIM.Enabled {
+        corimClient := corim.NewClient(config.CoRIM.RepositoryURL)
+
+        // Get manifest for current app version
+        manifest, err := corimClient.FetchCoRIM(config.AppVersion)
+        if err != nil {
+            return nil, fmt.Errorf("failed to fetch CoRIM: %w", err)
+        }
+
+        // Verify CoRIM signature
+        if err := manifest.VerifySignature(config.CoRIM.TrustedKeys); err != nil {
+            return nil, fmt.Errorf("invalid CoRIM signature: %w", err)
+        }
+
+        // Extract measurements
+        measurements := manifest.GetMeasurements()
+        v.policy.Measurements.AllowList = measurements
+
+        log.Info().
+            Int("count", len(measurements)).
+            Str("source", "corim").
+            Str("version", config.AppVersion).
+            Msg("Loaded reference values from CoRIM")
+    }
+
+    return v, nil
+}
+```
+
+**CI/CD Workflow:**
+
+```yaml
+# .github/workflows/build-sev-snp-image.yml
+name: Build SEV-SNP Image with CoRIM
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  build-and-publish-corim:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Build VM Image
+        run: |
+          # Build Ubuntu 22.04 + atls-proxy image
+          packer build image.pkr.hcl
+
+      - name: Boot in SEV-SNP & Extract Measurement
+        run: |
+          # Boot VM in GCP Confidential VM
+          gcloud compute instances create temp-measure \
+            --machine-type=n2d-standard-2 \
+            --confidential-compute-type=SEV_SNP \
+            --image=atls-proxy-${{ github.ref_name }}
+
+          # Extract measurement
+          MEASUREMENT=$(gcloud compute ssh temp-measure -- \
+            "sudo dmesg | grep 'SEV-SNP: measurement' | cut -d: -f2")
+
+          echo "measurement=$MEASUREMENT" >> $GITHUB_ENV
+
+      - name: Generate CoRIM Manifest
+        run: |
+          go run cmd/corim-gen/main.go \
+            --app-version=${{ github.ref_name }} \
+            --measurement=${{ env.measurement }} \
+            --vendor=GCP \
+            --model=n2d-standard-2 \
+            --image-id=ubuntu-2204-jammy-${{ env.image_date }} \
+            --output=atls-proxy-${{ github.ref_name }}.corim
+
+      - name: Sign CoRIM
+        run: |
+          # Sign with company ECDSA key
+          cocli corim sign \
+            --key=${{ secrets.CORIM_SIGNING_KEY }} \
+            --input=atls-proxy-${{ github.ref_name }}.corim \
+            --output=atls-proxy-${{ github.ref_name }}.signed.corim
+
+      - name: Upload to CoRIM Repository
+        run: |
+          curl -X POST https://corim.mycompany.com/upload \
+            -H "Authorization: Bearer ${{ secrets.CORIM_UPLOAD_TOKEN }}" \
+            -H "Content-Type: application/corim+cbor" \
+            --data-binary @atls-proxy-${{ github.ref_name }}.signed.corim
+
+      - name: Update Verifier Fleet
+        run: |
+          # Signal verifiers to refresh CoRIM
+          kubectl rollout restart deployment/atls-proxy-verifiers
+```
+
+**Benefits of CoRIM:**
+
+1. **Automation:**
+   - No manual copy-paste
+   - CI/CD generates and publishes automatically
+   - Verifiers fetch on startup
+
+2. **Security:**
+   - Cryptographically signed manifests
+   - Cannot be tampered without detection
+   - Provenance tracking (who, when, why)
+
+3. **Versioning:**
+   - Multiple versions coexist
+   - Validity periods enforced
+   - Deprecation support
+
+4. **Scalability:**
+   - Supports multiple cloud providers
+   - Multiple VM images per version
+   - Rolling updates without downtime
+
+5. **Standards Compliance:**
+   - IETF RATS architecture
+   - Interoperability with other verifiers (Veraison, Azure Attestation)
+   - Future-proof
+
+**Implementation Timeline:**
+
+- **Phase 3.1** (Q1 2025): AMD KDS integration for certificates
+- **Phase 3.2** (Q2 2025): CoRIM support for measurements
+- **Phase 3.3** (Q3 2025): External verifier integration
+
+See [PLAN.md](PLAN.md) for detailed implementation plans.
 
 ---
 
